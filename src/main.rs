@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod profile;
 mod api;
+mod state;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
