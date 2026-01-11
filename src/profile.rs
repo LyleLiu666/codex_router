@@ -1,31 +1,55 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use colored::Colorize;
 use std::fs;
-use std::path::PathBuf;
 
 use crate::auth::{self, AuthDotJson};
-use crate::config::{
-    get_auth_file, get_current_profile_file, get_profiles_dir, get_router_state_file,
-};
+use crate::config::{get_auth_file, get_current_profile_file, get_profiles_dir};
 
-/// List all available profiles
-pub fn list_profiles() -> Result<()> {
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileSummary {
+    pub name: String,
+    pub email: Option<String>,
+    pub is_current: bool,
+}
+
+pub fn list_profiles_data() -> Result<Vec<ProfileSummary>> {
     let profiles_dir = get_profiles_dir()?;
 
     if !profiles_dir.exists() {
-        println!("{}", "No profiles found. Use 'save' to create one.".yellow());
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let current_profile = get_current_profile()?;
+    let mut profiles = Vec::new();
 
-    let mut profiles: Vec<String> = fs::read_dir(&profiles_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .collect();
+    for entry in fs::read_dir(&profiles_dir)? {
+        let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
 
-    profiles.sort();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let profile_auth_file = entry.path().join("auth.json");
+        let email = fs::read_to_string(&profile_auth_file)
+            .ok()
+            .and_then(|auth_json| serde_json::from_str::<AuthDotJson>(&auth_json).ok())
+            .and_then(|auth| auth::get_email(&auth));
+
+        let is_current = current_profile.as_deref() == Some(name.as_str());
+        profiles.push(ProfileSummary {
+            name,
+            email,
+            is_current,
+        });
+    }
+
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(profiles)
+}
+
+/// List all available profiles
+pub fn list_profiles() -> Result<()> {
+    let profiles = list_profiles_data()?;
 
     if profiles.is_empty() {
         println!("{}", "No profiles found. Use 'save' to create one.".yellow());
@@ -34,33 +58,73 @@ pub fn list_profiles() -> Result<()> {
 
     println!("{}", "Available profiles:".green().bold());
 
-    for profile in &profiles {
-        let is_current = current_profile.as_deref() == Some(profile.as_str());
-        let marker = if is_current { "*" } else { " " };
-        let profile_str = if is_current {
-            format!("{} {} (current)", marker.cyan().bold(), profile.bold())
+    for profile in profiles {
+        let marker = if profile.is_current { "*" } else { " " };
+        let profile_str = if profile.is_current {
+            format!("{} {} (current)", marker.cyan().bold(), profile.name.bold())
         } else {
-            format!("{} {}", marker.white(), profile)
+            format!("{} {}", marker.white(), profile.name)
         };
 
-        // Try to load and display additional info
-        let profile_auth_file = profiles_dir.join(profile).join("auth.json");
-        if let Ok(auth_json) = fs::read_to_string(&profile_auth_file) {
-            if let Ok(auth) = serde_json::from_str::<AuthDotJson>(&auth_json) {
-                if let Some(email) = auth::get_email(&auth) {
-                    println!("  {} - {}", profile_str, email.dimmed());
-                } else {
-                    println!("  {}", profile_str);
-                }
-            } else {
-                println!("  {}", profile_str);
-            }
+        if let Some(email) = profile.email {
+            println!("  {} - {}", profile_str, email.dimmed());
         } else {
             println!("  {}", profile_str);
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let original = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                env::set_var(self.key, value);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn lists_profiles_with_current_marker() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("alpha")).unwrap();
+        fs::create_dir_all(profiles_dir.join("beta")).unwrap();
+        fs::write(profiles_dir.join("alpha").join("auth.json"), "{}").unwrap();
+        fs::write(profiles_dir.join("beta").join("auth.json"), "{}").unwrap();
+        fs::write(temp_dir.path().join(".current_profile"), "beta").unwrap();
+
+        let profiles = list_profiles_data().unwrap();
+
+        assert!(profiles.iter().any(|p| p.name == "beta" && p.is_current));
+    }
 }
 
 /// Switch to a profile
