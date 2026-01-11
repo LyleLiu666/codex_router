@@ -3,6 +3,8 @@ mod config;
 mod profile;
 mod api;
 mod state;
+mod app_state;
+mod worker;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
