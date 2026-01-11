@@ -3,7 +3,6 @@ use colored::Colorize;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::time::interval;
 
 use crate::auth;
 
@@ -55,57 +54,27 @@ impl QuotaInfo {
 }
 
 /// Check quota for the current profile
-pub async fn check_quota() -> Result<()> {
+pub async fn check_quota() -> Result<QuotaInfo> {
     let auth = auth::load_auth()?;
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    let quota_info = fetch_quota(&client, &auth).await?;
-
-    display_quota(&quota_info);
-
-    Ok(())
+    fetch_quota(&auth).await
 }
 
-/// Watch quota with auto-refresh
-pub async fn watch_quota() -> Result<()> {
-    let auth = auth::load_auth()?;
-
+/// Fetch quota for a given auth profile
+pub async fn fetch_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let mut ticker = interval(Duration::from_secs(30));
+    fetch_quota_with_client(&client, auth).await
+}
 
-    println!("{}", "Watching quota (Ctrl+C to exit)...".dimmed());
-    println!();
-
-    loop {
-        // Clear screen and print header
-        print!("\x1B[2J\x1B[1;1H");
-        println!("{}", "Codex Quota Monitor".cyan().bold());
-        println!("{}", "Press Ctrl+C to exit".dimmed());
-        println!();
-
-        match fetch_quota(&client, &auth).await {
-            Ok(quota_info) => {
-                display_quota(&quota_info);
-                println!();
-                println!("{}", format!("Last updated: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")).dimmed());
-            }
-            Err(e) => {
-                println!("{} {}", "Error fetching quota:".red(), e);
-            }
-        }
-
-        ticker.tick().await;
-    }
+/// Watch quota with auto-refresh (deprecated in UI mode)
+pub async fn watch_quota() -> Result<()> {
+    anyhow::bail!("watch_quota is only available in the desktop UI")
 }
 
 /// Fetch quota from Codex API
-async fn fetch_quota(client: &Client, auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
+async fn fetch_quota_with_client(client: &Client, auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
     let access_token = auth
         .tokens
         .as_ref()
@@ -131,7 +100,7 @@ async fn fetch_quota(client: &Client, auth: &auth::AuthDotJson) -> Result<QuotaI
             let error = resp.text().await.unwrap_or_default();
             anyhow::bail!("API returned status {}: {}", status, error);
         }
-        Err(e) => {
+        Err(_e) => {
             // If the quota endpoint doesn't work, return a mock response based on auth data
             get_fallback_quota(auth)
         }
@@ -167,43 +136,32 @@ fn get_fallback_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
 }
 
 /// Display quota information
-fn display_quota(quota: &QuotaInfo) {
-    println!("{}", "Account Information".green().bold());
-    println!("  {} {}", "Email:".white(), quota.email.cyan());
-    println!("  {} {}", "Plan:".white(), quota.plan_type.yellow());
-    println!("  {} {}", "Account ID:".white(), quota.account_id.dimmed());
-    println!();
 
-    println!("{}", "Usage".green().bold());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if let (Some(used_req), Some(total_req)) = (quota.used_requests, quota.total_requests) {
-        println!("  {} {}/{} ({}%)", "Requests:".white(),
-            used_req, total_req,
-            QuotaInfo::format_percentage(used_req, total_req)
-        );
-        println!("  {}", QuotaInfo::format_bar(used_req, total_req, 40));
-    } else {
-        println!("  {} {}", "Requests:".white(), "Not available".dimmed());
+    fn auth_stub() -> auth::AuthDotJson {
+        auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: None,
+            last_refresh: None,
+        }
     }
 
-    if let (Some(used_tok), Some(total_tok)) = (quota.used_tokens, quota.total_tokens) {
-        println!();
-        println!("  {} {}/{} ({}%)", "Tokens:".white(),
-            used_tok, total_tok,
-            QuotaInfo::format_percentage(used_tok, total_tok)
-        );
-        println!("  {}", QuotaInfo::format_bar(used_tok, total_tok, 40));
-    } else {
-        println!("  {} {}", "Tokens:".white(), "Not available".dimmed());
+    #[test]
+    fn parses_quota_response() {
+        let data = serde_json::json!({
+            "data": { "usage": [ { "n_requests": 5, "n_tokens": 10 } ] }
+        });
+        let info = parse_quota_response(&auth_stub(), &data).unwrap();
+        assert_eq!(info.used_requests, Some(5));
+        assert_eq!(info.used_tokens, Some(10));
     }
 
-    if let Some(reset_date) = &quota.reset_date {
-        println!();
-        println!("  {} {}", "Resets:".white(), reset_date.cyan());
+    #[tokio::test]
+    async fn fetch_quota_errors_without_token() {
+        let err = fetch_quota(&auth_stub()).await.unwrap_err();
+        assert!(err.to_string().contains("No valid token"));
     }
-
-    println!();
-    println!("{}", "Note:".yellow().italic());
-    println!("  Quota information is fetched from OpenAI's API.");
-    println!("  Some plans may not expose detailed usage information.");
 }
