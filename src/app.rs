@@ -1,15 +1,20 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::app_state::{AppCommand, AppEvent, AppState};
-use crate::state::RouterState;
+use crate::refresh::RefreshSchedule;
+use crate::state::{self, RouterState};
 use crate::tray::{self, TrayEvent, TrayHandle};
 use crate::worker;
 
 pub struct RouterApp {
     state: AppState,
+    router_state: RouterState,
+    quota_refresh: RefreshSchedule,
+    allow_close: bool,
     cmd_tx: Sender<AppCommand>,
     evt_rx: Receiver<AppEvent>,
     tray_rx: Receiver<TrayEvent>,
@@ -29,16 +34,35 @@ impl RouterApp {
             Some(tray::start_tray(tray_tx))
         };
 
-        let state = AppState::default();
+        let mut state = AppState::default();
+        let router_state = match state::load_state() {
+            Ok(router_state) => {
+                apply_router_state(&mut state, &router_state);
+                router_state
+            }
+            Err(err) => {
+                state.error = Some(err.to_string());
+                RouterState::default()
+            }
+        };
         let _ = cmd_tx.send(AppCommand::LoadProfiles);
 
         Self {
             state,
+            router_state,
+            quota_refresh: RefreshSchedule::new(),
+            allow_close: false,
             cmd_tx,
             evt_rx,
             tray_rx,
             tray_handle,
             worker_handle: Some(worker_handle),
+        }
+    }
+
+    fn persist_router_state(&mut self) {
+        if let Err(err) = state::save_state(&self.router_state) {
+            self.state.error = Some(err.to_string());
         }
     }
 }
@@ -99,15 +123,50 @@ fn update_router_state_settings(
     changed
 }
 
+fn auto_refresh_tick(
+    enabled: bool,
+    schedule: &mut RefreshSchedule,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    schedule.tick(now, interval)
+}
+
 impl eframe::App for RouterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            match close_action(self.allow_close) {
+                CloseAction::Hide => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                CloseAction::Close => {}
+            }
+        }
+
         while let Ok(event) = self.evt_rx.try_recv() {
+            let prev_profile = self.state.current_profile.clone();
+            let is_profiles_loaded = matches!(event, AppEvent::ProfilesLoaded(_));
             if let AppEvent::ProfilesLoaded(ref profiles) = event {
                 if let Some(tray_handle) = &self.tray_handle {
                     tray_handle.update_profiles(profiles);
                 }
             }
             self.state.apply_event(event);
+            if is_profiles_loaded {
+                let next_profile = self.state.current_profile.clone();
+                if should_fetch_on_profile_change(
+                    prev_profile.as_deref(),
+                    next_profile.as_deref(),
+                ) {
+                    self.router_state.last_selected_profile = next_profile;
+                    self.persist_router_state();
+                    let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+                }
+            }
         }
 
         while let Ok(event) = self.tray_rx.try_recv() {
@@ -120,6 +179,7 @@ impl eframe::App for RouterApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 TrayEvent::Quit => {
+                    self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 _ => {}
@@ -129,15 +189,95 @@ impl eframe::App for RouterApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Codex Router");
 
-            if ui.button("Refresh Profiles").clicked() {
-                let _ = self.cmd_tx.send(AppCommand::LoadProfiles);
-            }
+            ui.group(|ui| {
+                ui.label("Quota");
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh Quota").clicked() {
+                        let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+                        self.quota_refresh.clear();
+                    }
+
+                    let mut auto_refresh_enabled = self.state.auto_refresh_enabled;
+                    if ui
+                        .checkbox(&mut auto_refresh_enabled, "Auto refresh")
+                        .changed()
+                    {
+                        let interval_seconds = self.state.refresh_interval_seconds;
+                        let changed = update_router_state_settings(
+                            &mut self.router_state,
+                            &mut self.state,
+                            interval_seconds,
+                            auto_refresh_enabled,
+                        );
+                        if changed {
+                            self.persist_router_state();
+                        }
+                        self.quota_refresh.clear();
+                        if auto_refresh_enabled {
+                            let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+                        }
+                    }
+
+                    let mut interval_minutes = (self.state.refresh_interval_seconds / 60).max(1);
+                    let response = ui.add(
+                        egui::DragValue::new(&mut interval_minutes)
+                            .clamp_range(1..=120)
+                            .suffix(" min"),
+                    );
+                    if response.changed() {
+                        let interval_seconds = interval_minutes.saturating_mul(60);
+                        let auto_refresh_enabled = self.state.auto_refresh_enabled;
+                        let changed = update_router_state_settings(
+                            &mut self.router_state,
+                            &mut self.state,
+                            interval_seconds,
+                            auto_refresh_enabled,
+                        );
+                        if changed {
+                            self.persist_router_state();
+                            self.quota_refresh.clear();
+                        }
+                    }
+                });
+
+                if let Some(last_updated) = &self.state.last_updated {
+                    ui.label(format!("Last updated: {}", last_updated.to_rfc3339()));
+                }
+
+                if let Some(quota) = &self.state.quota {
+                    ui.label(format!("Account: {}", quota.account_id));
+                    ui.label(format!("Email: {}", quota.email));
+                    ui.label(format!("Plan: {}", quota.plan_type));
+                    if let Some(used) = quota.used_requests {
+                        ui.label(format!("Requests used: {}", used));
+                    } else {
+                        ui.label("Requests used: -");
+                    }
+                    if let Some(used) = quota.used_tokens {
+                        ui.label(format!("Tokens used: {}", used));
+                    } else {
+                        ui.label("Tokens used: -");
+                    }
+                    if let Some(reset) = &quota.reset_date {
+                        ui.label(format!("Reset: {}", reset));
+                    }
+                } else {
+                    ui.label("No quota data yet.");
+                }
+            });
 
             if let Some(error) = &self.state.error {
                 ui.colored_label(egui::Color32::RED, error);
             }
 
             ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("Profiles");
+                if ui.button("Refresh Profiles").clicked() {
+                    let _ = self.cmd_tx.send(AppCommand::LoadProfiles);
+                }
+            });
 
             for profile in &self.state.profiles {
                 let name = if profile.is_current {
@@ -153,6 +293,19 @@ impl eframe::App for RouterApp {
                 });
             }
         });
+
+        let interval = Duration::from_secs(self.state.refresh_interval_seconds.max(60));
+        if auto_refresh_tick(
+            self.state.auto_refresh_enabled,
+            &mut self.quota_refresh,
+            Instant::now(),
+            interval,
+        ) {
+            let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+        }
+        if self.state.auto_refresh_enabled {
+            ctx.request_repaint_after(interval);
+        }
     }
 }
 
@@ -168,6 +321,8 @@ impl Drop for RouterApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::refresh::RefreshSchedule;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn router_app_initializes_state() {
@@ -229,5 +384,17 @@ mod tests {
         assert!(changed);
         assert_eq!(router_state.refresh_interval_seconds, 900);
         assert!(!router_state.auto_refresh_enabled);
+    }
+
+    #[test]
+    fn auto_refresh_disabled_never_triggers() {
+        let mut schedule = RefreshSchedule::new();
+        let now = Instant::now();
+        let interval = Duration::from_secs(60);
+
+        let triggered = auto_refresh_tick(false, &mut schedule, now, interval);
+
+        assert!(!triggered);
+        assert!(schedule.next_due().is_none());
     }
 }

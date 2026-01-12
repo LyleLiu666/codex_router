@@ -29,6 +29,12 @@ pub async fn check_quota() -> Result<QuotaInfo> {
 
 /// Fetch quota for a given auth profile
 pub async fn fetch_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
+    let _ = auth
+        .tokens
+        .as_ref()
+        .map(|t| t.access_token.clone())
+        .or_else(|| auth.openai_api_key.clone())
+        .context("No valid token found")?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
