@@ -1,5 +1,4 @@
 use anyhow::Result;
-use colored::Colorize;
 use std::fs;
 
 use crate::auth::{self, AuthDotJson};
@@ -47,66 +46,11 @@ pub fn list_profiles_data() -> Result<Vec<ProfileSummary>> {
     Ok(profiles)
 }
 
-/// List all available profiles
-pub fn list_profiles() -> Result<()> {
-    let profiles = list_profiles_data()?;
-
-    if profiles.is_empty() {
-        println!("{}", "No profiles found. Use 'save' to create one.".yellow());
-        return Ok(());
-    }
-
-    println!("{}", "Available profiles:".green().bold());
-
-    for profile in profiles {
-        let marker = if profile.is_current { "*" } else { " " };
-        let profile_str = if profile.is_current {
-            format!("{} {} (current)", marker.cyan().bold(), profile.name.bold())
-        } else {
-            format!("{} {}", marker.white(), profile.name)
-        };
-
-        if let Some(email) = profile.email {
-            println!("  {} - {}", profile_str, email.dimmed());
-        } else {
-            println!("  {}", profile_str);
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let original = env::var(key).ok();
-            env::set_var(key, value);
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                env::set_var(self.key, value);
-            } else {
-                env::remove_var(self.key);
-            }
-        }
-    }
+    use crate::test_support::{EnvGuard, ENV_LOCK};
 
     #[test]
     fn lists_profiles_with_current_marker() {
@@ -134,10 +78,7 @@ pub async fn switch_profile(profile_name: &str) -> Result<()> {
     let profile_auth_file = profiles_dir.join(profile_name).join("auth.json");
 
     if !profile_auth_file.exists() {
-        anyhow::bail!(
-            "Profile '{}' not found. Use 'list' to see available profiles.",
-            profile_name
-        );
+        anyhow::bail!("Profile '{}' not found.", profile_name);
     }
 
     // Read profile auth
@@ -154,17 +95,6 @@ pub async fn switch_profile(profile_name: &str) -> Result<()> {
 
     // Update current profile marker
     save_current_profile(profile_name)?;
-
-    println!(
-        "{} {}",
-        "Switched to profile:".green().bold(),
-        profile_name.cyan().bold()
-    );
-
-    // Display account info
-    if let Some(email) = auth::get_email(&auth) {
-        println!("{} {}", "Email:".white(), email.white());
-    }
 
     Ok(())
 }
@@ -183,10 +113,7 @@ pub fn save_profile(profile_name: &str) -> Result<()> {
 
     // Check if profile already exists
     if profile_dir.exists() {
-        anyhow::bail!(
-            "Profile '{}' already exists. Delete it first with 'delete'.",
-            profile_name
-        );
+        anyhow::bail!("Profile '{}' already exists. Delete it first.", profile_name);
     }
 
     // Create profile directory
@@ -197,16 +124,9 @@ pub fn save_profile(profile_name: &str) -> Result<()> {
     let auth_json = serde_json::to_string_pretty(&auth)?;
     fs::write(&profile_auth_file, auth_json)?;
 
-    println!(
-        "{} {}",
-        "Saved current auth as profile:".green().bold(),
-        profile_name.cyan().bold()
-    );
-
     // Set as current if no current profile
     if get_current_profile()?.is_none() {
         save_current_profile(profile_name)?;
-        println!("{}", "(Set as current profile)".dimmed());
     }
 
     Ok(())
@@ -232,33 +152,6 @@ pub fn delete_profile(profile_name: &str) -> Result<()> {
     }
 
     fs::remove_dir_all(&profile_dir)?;
-
-    println!(
-        "{} {}",
-        "Deleted profile:".green().bold(),
-        profile_name.cyan().bold()
-    );
-
-    Ok(())
-}
-
-/// Show current profile info
-pub fn show_current() -> Result<()> {
-    let auth = auth::load_auth()?;
-
-    if let Some(profile_name) = get_current_profile()? {
-        println!(
-            "{} {}",
-            "Current profile:".green().bold(),
-            profile_name.cyan().bold()
-        );
-    } else {
-        println!("{}", "Current profile:".green().bold());
-        println!("  (unnamed/default)");
-    }
-
-    println!();
-    println!("{}", auth::format_auth_info(&auth));
 
     Ok(())
 }

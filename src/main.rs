@@ -6,6 +6,9 @@ mod state;
 mod app_state;
 mod worker;
 mod app;
+mod tray;
+#[cfg(test)]
+mod test_support;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();

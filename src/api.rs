@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use colored::Colorize;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -20,37 +19,6 @@ pub struct QuotaInfo {
 }
 
 impl QuotaInfo {
-    fn format_percentage(used: u64, total: u64) -> String {
-        if total == 0 {
-            return "N/A".to_string();
-        }
-        let pct = (used as f64 / total as f64) * 100.0;
-        format!("{:.1}%", pct)
-    }
-
-    fn format_bar(used: u64, total: u64, width: usize) -> String {
-        if total == 0 {
-            return "│".repeat(width);
-        }
-
-        let filled = ((used as f64 / total as f64) * width as f64).ceil() as usize;
-        let filled = filled.min(width);
-
-        let filled_str = "█".repeat(filled);
-        let empty_str = "░".repeat(width - filled);
-
-        let bar = format!("{}{}", filled_str, empty_str);
-
-        // Color code based on usage
-        let pct = (used as f64 / total as f64) * 100.0;
-        if pct >= 90.0 {
-            bar.red().to_string()
-        } else if pct >= 70.0 {
-            bar.yellow().to_string()
-        } else {
-            bar.green().to_string()
-        }
-    }
 }
 
 /// Check quota for the current profile
@@ -134,8 +102,6 @@ fn get_fallback_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
         reset_date: None,
     })
 }
-
-/// Display quota information
 
 #[cfg(test)]
 mod tests {
