@@ -4,6 +4,7 @@ use std::thread::JoinHandle;
 use eframe::egui;
 
 use crate::app_state::{AppCommand, AppEvent, AppState};
+use crate::state::RouterState;
 use crate::tray::{self, TrayEvent, TrayHandle};
 use crate::worker;
 
@@ -48,6 +49,54 @@ fn command_for_tray_event(event: &TrayEvent) -> Option<AppCommand> {
         TrayEvent::SwitchProfile(name) => Some(AppCommand::SwitchProfile(name.clone())),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    Hide,
+    Close,
+}
+
+fn close_action(allow_close: bool) -> CloseAction {
+    if allow_close {
+        CloseAction::Close
+    } else {
+        CloseAction::Hide
+    }
+}
+
+fn should_fetch_on_profile_change(prev: Option<&str>, next: Option<&str>) -> bool {
+    match (prev, next) {
+        (None, None) => false,
+        (Some(prev), Some(next)) => prev != next,
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+    }
+}
+
+fn apply_router_state(app_state: &mut AppState, router_state: &RouterState) {
+    app_state.refresh_interval_seconds = router_state.refresh_interval_seconds;
+    app_state.auto_refresh_enabled = router_state.auto_refresh_enabled;
+}
+
+fn update_router_state_settings(
+    router_state: &mut RouterState,
+    app_state: &mut AppState,
+    interval_seconds: u64,
+    auto_refresh_enabled: bool,
+) -> bool {
+    let mut changed = false;
+    if router_state.refresh_interval_seconds != interval_seconds {
+        router_state.refresh_interval_seconds = interval_seconds;
+        app_state.refresh_interval_seconds = interval_seconds;
+        changed = true;
+    }
+    if router_state.auto_refresh_enabled != auto_refresh_enabled {
+        router_state.auto_refresh_enabled = auto_refresh_enabled;
+        app_state.auto_refresh_enabled = auto_refresh_enabled;
+        changed = true;
+    }
+    changed
 }
 
 impl eframe::App for RouterApp {
@@ -139,5 +188,46 @@ mod tests {
 
         let open = command_for_tray_event(&TrayEvent::OpenWindow);
         assert!(open.is_none());
+    }
+
+    #[test]
+    fn close_action_hides_unless_allowed() {
+        assert!(matches!(close_action(false), CloseAction::Hide));
+        assert!(matches!(close_action(true), CloseAction::Close));
+    }
+
+    #[test]
+    fn profile_change_triggers_refresh() {
+        assert!(should_fetch_on_profile_change(None, Some("a")));
+        assert!(should_fetch_on_profile_change(Some("a"), Some("b")));
+        assert!(!should_fetch_on_profile_change(Some("a"), Some("a")));
+        assert!(!should_fetch_on_profile_change(None, None));
+    }
+
+    #[test]
+    fn applies_router_state_to_app_state() {
+        let mut app_state = AppState::default();
+        let router_state = RouterState {
+            refresh_interval_seconds: 300,
+            auto_refresh_enabled: false,
+            last_selected_profile: Some("work".to_string()),
+        };
+
+        apply_router_state(&mut app_state, &router_state);
+
+        assert_eq!(app_state.refresh_interval_seconds, 300);
+        assert!(!app_state.auto_refresh_enabled);
+    }
+
+    #[test]
+    fn update_router_state_settings_returns_change() {
+        let mut app_state = AppState::default();
+        let mut router_state = RouterState::default();
+
+        let changed = update_router_state_settings(&mut router_state, &mut app_state, 900, false);
+
+        assert!(changed);
+        assert_eq!(router_state.refresh_interval_seconds, 900);
+        assert!(!router_state.auto_refresh_enabled);
     }
 }
