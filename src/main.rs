@@ -3,6 +3,7 @@ mod config;
 mod profile;
 mod api;
 mod state;
+mod refresh;
 mod app_state;
 mod worker;
 mod app;
