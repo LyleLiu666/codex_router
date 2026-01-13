@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
-use chrono::{DateTime, Utc};
 
 use crate::config::{get_auth_file, get_codex_home};
 
@@ -22,7 +23,8 @@ pub struct AuthDotJson {
 /// Token data structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TokenData {
-    pub id_token: IdTokenInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<IdToken>,
     pub access_token: String,
     pub refresh_token: String,
     pub account_id: Option<String>,
@@ -36,7 +38,33 @@ pub struct IdTokenInfo {
     pub chatgpt_plan_type: Option<String>,
     #[serde(rename = "chatgpt_account_id")]
     pub chatgpt_account_id: Option<String>,
+    #[serde(
+        rename = "https://api.openai.com/auth",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub openai_auth: Option<OpenAiAuthClaims>,
     pub raw_jwt: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum IdToken {
+    Raw(String),
+    Info(IdTokenInfo),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenAiAuthClaims {
+    pub chatgpt_plan_type: Option<String>,
+    pub chatgpt_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JwtClaims {
+    pub email: Option<String>,
+    #[serde(rename = "https://api.openai.com/auth")]
+    pub openai_auth: Option<OpenAiAuthClaims>,
 }
 
 /// Load auth from the active auth.json file
@@ -101,22 +129,64 @@ pub fn load_auth_from_profile(profile_name: &str) -> Result<AuthDotJson> {
     Ok(auth)
 }
 
+fn decode_jwt_claims(raw_jwt: &str) -> Option<IdTokenInfo> {
+    let payload = raw_jwt.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: JwtClaims = serde_json::from_slice(&decoded).ok()?;
+    let (chatgpt_plan_type, chatgpt_account_id) = claims
+        .openai_auth
+        .map(|auth| (auth.chatgpt_plan_type, auth.chatgpt_account_id))
+        .unwrap_or((None, None));
+
+    Some(IdTokenInfo {
+        email: claims.email,
+        chatgpt_plan_type,
+        chatgpt_account_id,
+        openai_auth: None,
+        raw_jwt: Some(raw_jwt.to_string()),
+    })
+}
+
+fn get_id_token_info(auth: &AuthDotJson) -> Option<IdTokenInfo> {
+    let id_token = auth.tokens.as_ref()?.id_token.as_ref()?;
+    match id_token {
+        IdToken::Info(info) => Some(info.clone()),
+        IdToken::Raw(raw) => decode_jwt_claims(raw),
+    }
+}
+
+fn get_plan_from_info(info: &IdTokenInfo) -> Option<String> {
+    info.chatgpt_plan_type.clone().or_else(|| {
+        info.openai_auth
+            .as_ref()
+            .and_then(|auth| auth.chatgpt_plan_type.clone())
+    })
+}
+
+fn get_account_from_info(info: &IdTokenInfo) -> Option<String> {
+    info.chatgpt_account_id.clone().or_else(|| {
+        info.openai_auth
+            .as_ref()
+            .and_then(|auth| auth.chatgpt_account_id.clone())
+    })
+}
+
 /// Get account ID from auth
 pub fn get_account_id(auth: &AuthDotJson) -> Option<String> {
     auth.tokens
         .as_ref()
         .and_then(|t| t.account_id.clone())
-        .or_else(|| auth.tokens.as_ref()?.id_token.chatgpt_account_id.clone())
+        .or_else(|| get_id_token_info(auth).and_then(|info| get_account_from_info(&info)))
 }
 
 /// Get email from auth
 pub fn get_email(auth: &AuthDotJson) -> Option<String> {
-    auth.tokens.as_ref()?.id_token.email.clone()
+    get_id_token_info(auth).and_then(|info| info.email.clone())
 }
 
 /// Get plan type from auth
 pub fn get_plan_type(auth: &AuthDotJson) -> Option<String> {
-    auth.tokens.as_ref()?.id_token.chatgpt_plan_type.clone()
+    get_id_token_info(auth).and_then(|info| get_plan_from_info(&info))
 }
 
 /// Format auth info for display
@@ -126,4 +196,36 @@ pub fn format_auth_info(auth: &AuthDotJson) -> String {
     let plan = get_plan_type(auth).unwrap_or_else(|| "N/A".to_string());
 
     format!("Email: {}\nAccount ID: {}\nPlan: {}", email, account_id, plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{EnvGuard, ENV_LOCK};
+    use std::fs;
+
+    #[test]
+    fn loads_auth_with_jwt_id_token() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8iLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0XzEyMyJ9fQ.sig";
+        let auth_json = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "account_id": "acct_123",
+                "id_token": jwt
+            }
+        });
+
+        fs::write(temp_dir.path().join("auth.json"), auth_json.to_string()).unwrap();
+
+        let auth = load_auth().unwrap();
+        assert_eq!(get_email(&auth), Some("user@example.com".to_string()));
+        assert_eq!(get_account_id(&auth), Some("acct_123".to_string()));
+        assert_eq!(get_plan_type(&auth), Some("pro".to_string()));
+    }
 }

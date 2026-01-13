@@ -17,6 +17,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Codex Router",
         options,
-        Box::new(|_cc| Box::new(app::RouterApp::new())),
+        Box::new(|_cc| Ok(Box::new(app::RouterApp::new()))),
     )
 }
