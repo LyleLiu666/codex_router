@@ -1,7 +1,10 @@
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 
 use crate::app_state::{AppCommand, AppEvent};
+use crate::login_output;
 use crate::{api, auth, profile};
 
 pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> JoinHandle<()> {
@@ -35,7 +38,8 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                 }
                 AppCommand::SaveProfile(name) => {
                     match profile::save_profile(&name) {
-                        Ok(()) => {
+                        Ok(outcome) => {
+                            let _ = evt_tx.send(AppEvent::ProfileSaved(outcome));
                             if let Ok(profiles) = profile::list_profiles_data() {
                                 let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                             }
@@ -68,6 +72,111 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                             let _ = evt_tx.send(AppEvent::Error(err.to_string()));
                         }
                     }
+                }
+                AppCommand::RunLogin => {
+                    let evt_tx = evt_tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = evt_tx.send(AppEvent::LoginOutput {
+                            output: String::new(),
+                            parsed: login_output::LoginOutput::default(),
+                            running: true,
+                        });
+
+                        let mut child = match Command::new("codex")
+                            .arg("login")
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                        {
+                            Ok(child) => child,
+                            Err(err) => {
+                                let _ = evt_tx.send(AppEvent::LoginFinished {
+                                    success: false,
+                                    message: format!("Failed to start codex login: {err}"),
+                                });
+                                return;
+                            }
+                        };
+
+                        let stdout = child.stdout.take();
+                        let stderr = child.stderr.take();
+
+                        let spawn_reader = |stream: Option<std::process::ChildStdout>| {
+                            let Some(stream) = stream else { return None };
+                            let evt_tx = evt_tx.clone();
+                            Some(std::thread::spawn(move || {
+                                let reader = BufReader::new(stream);
+                                for line in reader.lines().map_while(Result::ok) {
+                                    let mut chunk = line;
+                                    chunk.push('\n');
+                                    let parsed = login_output::parse_login_output(&chunk);
+                                    let _ = evt_tx.send(AppEvent::LoginOutput {
+                                        output: chunk,
+                                        parsed,
+                                        running: true,
+                                    });
+                                }
+                            }))
+                        };
+
+                        let stdout_handle = spawn_reader(stdout);
+
+                        let stderr_handle = stderr.map(|stream| {
+                            let evt_tx = evt_tx.clone();
+                            std::thread::spawn(move || {
+                                let reader = BufReader::new(stream);
+                                for line in reader.lines().map_while(Result::ok) {
+                                    let mut chunk = line;
+                                    chunk.push('\n');
+                                    let parsed = login_output::parse_login_output(&chunk);
+                                    let _ = evt_tx.send(AppEvent::LoginOutput {
+                                        output: chunk,
+                                        parsed,
+                                        running: true,
+                                    });
+                                }
+                            })
+                        });
+
+                        let status = child.wait();
+
+                        if let Some(handle) = stdout_handle {
+                            let _ = handle.join();
+                        }
+                        if let Some(handle) = stderr_handle {
+                            let _ = handle.join();
+                        }
+
+                        let (success, message) = match status {
+                            Ok(status) if status.success() => (true, "codex login finished".into()),
+                            Ok(status) => (false, format!("codex login failed: {status}")),
+                            Err(err) => (false, format!("codex login failed: {err}")),
+                        };
+
+                        let _ = evt_tx.send(AppEvent::LoginFinished {
+                            success,
+                            message: message.clone(),
+                        });
+
+                        if success {
+                            if let Ok(profiles) = profile::list_profiles_data() {
+                                let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                            }
+
+                            let _ = auth::load_auth()
+                                .and_then(|auth| {
+                                    let runtime = tokio::runtime::Runtime::new()
+                                        .expect("failed to create runtime");
+                                    runtime.block_on(api::fetch_quota(&auth))
+                                })
+                                .map(|quota| {
+                                    let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
+                                });
+                        }
+                    });
+                }
+                AppCommand::OpenLoginUrl(url) => {
+                    let _ = Command::new("open").arg(url).status();
                 }
                 AppCommand::Shutdown => break,
             }

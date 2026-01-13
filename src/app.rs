@@ -279,17 +279,75 @@ impl eframe::App for RouterApp {
                 }
             });
 
+            ui.horizontal(|ui| {
+                ui.label("Save as");
+                ui.text_edit_singleline(&mut self.state.profile_name_input);
+                let trimmed = self.state.profile_name_input.trim().to_string();
+                if ui
+                    .add_enabled(!trimmed.is_empty(), egui::Button::new("Save Current Profile"))
+                    .clicked()
+                {
+                    let _ = self.cmd_tx.send(AppCommand::SaveProfile(trimmed));
+                    self.state.profile_name_input.clear();
+                }
+            });
+
+            if let Some(message) = &self.state.profile_message {
+                ui.label(message);
+            }
+
+            if self.state.profiles.is_empty() {
+                ui.label("No profiles yet. Save current login or run codex login.");
+            }
+
             for profile in &self.state.profiles {
-                let name = if profile.is_current {
-                    format!("* {}", profile.name)
-                } else {
-                    profile.name.clone()
-                };
                 ui.horizontal(|ui| {
-                    ui.label(name);
+                    ui.label(&profile.name);
                     if let Some(email) = &profile.email {
                         ui.label(email);
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if profile.is_current {
+                            ui.add_enabled(false, egui::Button::new("Current"));
+                        } else if ui.button("Switch").clicked() {
+                            let _ = self
+                                .cmd_tx
+                                .send(AppCommand::SwitchProfile(profile.name.clone()));
+                        }
+                    });
+                });
+            }
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("Login");
+                let run_button = ui.add_enabled(
+                    !self.state.login_running,
+                    egui::Button::new("Run codex login"),
+                );
+                if run_button.clicked() {
+                    let _ = self.cmd_tx.send(AppCommand::RunLogin);
+                }
+                if self.state.login_running {
+                    ui.label("Running…");
+                }
+            });
+
+            if let Some(url) = &self.state.login_url {
+                ui.horizontal(|ui| {
+                    ui.label(url);
+                    if ui.button("Open URL").clicked() {
+                        let _ = self.cmd_tx.send(AppCommand::OpenLoginUrl(url.clone()));
+                    }
+                });
+            }
+            if let Some(code) = &self.state.login_code {
+                ui.label(format!("Code: {code}"));
+            }
+            if !self.state.login_output.is_empty() {
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    ui.monospace(&self.state.login_output);
                 });
             }
         });

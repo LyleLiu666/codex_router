@@ -8,6 +8,7 @@ mod app_state;
 mod worker;
 mod app;
 mod tray;
+mod login_output;
 #[cfg(test)]
 mod test_support;
 

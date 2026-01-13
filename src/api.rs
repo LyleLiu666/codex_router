@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::auth;
+
+const DEFAULT_USAGE_URL: &str = "https://api.openai.com/v1/usage";
 
 /// Quota information
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -39,7 +42,7 @@ pub async fn fetch_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    fetch_quota_with_client(&client, auth).await
+    fetch_quota_with_client(&client, auth, DEFAULT_USAGE_URL).await
 }
 
 /// Watch quota with auto-refresh (deprecated in UI mode)
@@ -48,7 +51,11 @@ pub async fn watch_quota() -> Result<()> {
 }
 
 /// Fetch quota from Codex API
-async fn fetch_quota_with_client(client: &Client, auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
+async fn fetch_quota_with_client(
+    client: &Client,
+    auth: &auth::AuthDotJson,
+    url: &str,
+) -> Result<QuotaInfo> {
     let access_token = auth
         .tokens
         .as_ref()
@@ -59,7 +66,7 @@ async fn fetch_quota_with_client(client: &Client, auth: &auth::AuthDotJson) -> R
     // Note: The actual quota endpoint may be different
     // This is a placeholder implementation
     let response = client
-        .get("https://api.openai.com/v1/usage")
+        .get(url)
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await;
@@ -72,6 +79,9 @@ async fn fetch_quota_with_client(client: &Client, auth: &auth::AuthDotJson) -> R
         Ok(resp) => {
             let status = resp.status();
             let error = resp.text().await.unwrap_or_default();
+            if status == StatusCode::UNAUTHORIZED && auth.openai_api_key.is_none() && auth.tokens.is_some() {
+                return get_fallback_quota(auth);
+            }
             anyhow::bail!("API returned status {}: {}", status, error);
         }
         Err(_e) => {
@@ -112,6 +122,9 @@ fn get_fallback_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn auth_stub() -> auth::AuthDotJson {
         auth::AuthDotJson {
@@ -135,5 +148,46 @@ mod tests {
     async fn fetch_quota_errors_without_token() {
         let err = fetch_quota(&auth_stub()).await.unwrap_err();
         assert!(err.to_string().contains("No valid token"));
+    }
+
+    #[tokio::test]
+    async fn fetch_quota_falls_back_on_invalid_api_key_when_using_tokens() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: None,
+                access_token: "eyJhbGci".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/v1/usage", addr);
+
+        let quota = fetch_quota_with_client(&client, &auth, &url).await.unwrap();
+        assert_eq!(quota.account_id, "acct_123");
+        assert!(quota.used_requests.is_none());
+        assert!(quota.used_tokens.is_none());
+
+        server.join().unwrap();
     }
 }

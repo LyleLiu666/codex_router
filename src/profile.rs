@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::fs;
 
-use crate::auth::{self, AuthDotJson};
+use crate::auth::{self, AuthDotJson, IdToken};
 use crate::config::{get_auth_file, get_current_profile_file, get_profiles_dir};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -11,10 +11,18 @@ pub struct ProfileSummary {
     pub is_current: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveProfileOutcome {
+    Created { name: String },
+    Updated { name: String },
+    AlreadyExists { name: String },
+}
+
 pub fn list_profiles_data() -> Result<Vec<ProfileSummary>> {
     let profiles_dir = get_profiles_dir()?;
 
     if !profiles_dir.exists() {
+        fs::create_dir_all(&profiles_dir)?;
         return Ok(Vec::new());
     }
 
@@ -46,11 +54,29 @@ pub fn list_profiles_data() -> Result<Vec<ProfileSummary>> {
     Ok(profiles)
 }
 
+fn token_fingerprint(auth: &AuthDotJson) -> Option<String> {
+    if let Some(key) = &auth.openai_api_key {
+        return Some(key.clone());
+    }
+    let tokens = auth.tokens.as_ref()?;
+    let id_token = tokens.id_token.as_ref().and_then(|token| match token {
+        IdToken::Raw(raw) => Some(raw.clone()),
+        IdToken::Info(info) => info.raw_jwt.clone(),
+    });
+    Some(format!(
+        "{}|{}|{}",
+        tokens.access_token,
+        tokens.refresh_token,
+        id_token.unwrap_or_default()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::auth::{IdToken, TokenData};
     use crate::test_support::{EnvGuard, ENV_LOCK};
+    use std::fs;
 
     #[test]
     fn lists_profiles_with_current_marker() {
@@ -68,6 +94,150 @@ mod tests {
         let profiles = list_profiles_data().unwrap();
 
         assert!(profiles.iter().any(|p| p.name == "beta" && p.is_current));
+    }
+
+    #[test]
+    fn list_profiles_creates_profiles_dir_when_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        assert!(!profiles_dir.exists());
+
+        let profiles = list_profiles_data().unwrap();
+
+        assert!(profiles.is_empty());
+        assert!(profiles_dir.exists());
+    }
+
+    #[test]
+    fn token_fingerprint_prefers_api_key() {
+        let auth = AuthDotJson {
+            openai_api_key: Some("sk-test".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+
+        assert_eq!(token_fingerprint(&auth), Some("sk-test".to_string()));
+    }
+
+    #[test]
+    fn token_fingerprint_uses_tokens_when_no_api_key() {
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: Some(IdToken::Raw("id.raw".to_string())),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        assert_eq!(
+            token_fingerprint(&auth),
+            Some("access|refresh|id.raw".to_string())
+        );
+    }
+
+    #[test]
+    fn save_profile_noops_when_account_id_matches_and_token_same() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: Some(IdToken::Raw("id.raw".to_string())),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        fs::write(
+            temp_dir.path().join("auth.json"),
+            serde_json::to_string_pretty(&auth).unwrap(),
+        )
+        .unwrap();
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("work")).unwrap();
+        fs::write(
+            profiles_dir.join("work").join("auth.json"),
+            serde_json::to_string_pretty(&auth).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = save_profile("new").unwrap();
+
+        assert_eq!(
+            outcome,
+            SaveProfileOutcome::AlreadyExists {
+                name: "work".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn save_profile_overwrites_when_account_id_matches_and_token_changes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let old_auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: Some(IdToken::Raw("id.old".to_string())),
+                access_token: "access-old".to_string(),
+                refresh_token: "refresh-old".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let new_auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: Some(IdToken::Raw("id.new".to_string())),
+                access_token: "access-new".to_string(),
+                refresh_token: "refresh-new".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        fs::write(
+            temp_dir.path().join("auth.json"),
+            serde_json::to_string_pretty(&new_auth).unwrap(),
+        )
+        .unwrap();
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("work")).unwrap();
+        fs::write(
+            profiles_dir.join("work").join("auth.json"),
+            serde_json::to_string_pretty(&old_auth).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = save_profile("ignored").unwrap();
+
+        assert_eq!(
+            outcome,
+            SaveProfileOutcome::Updated {
+                name: "work".to_string()
+            }
+        );
+
+        let updated = fs::read_to_string(profiles_dir.join("work").join("auth.json")).unwrap();
+        let updated_value: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        let expected_value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string_pretty(&new_auth).unwrap()).unwrap();
+        assert_eq!(updated_value, expected_value);
     }
 }
 
@@ -100,7 +270,7 @@ pub async fn switch_profile(profile_name: &str) -> Result<()> {
 }
 
 /// Save current auth as a profile
-pub fn save_profile(profile_name: &str) -> Result<()> {
+pub fn save_profile(profile_name: &str) -> Result<SaveProfileOutcome> {
     // Load current auth
     let auth = auth::load_auth()?;
 
@@ -109,27 +279,55 @@ pub fn save_profile(profile_name: &str) -> Result<()> {
     // Create profiles directory
     fs::create_dir_all(&profiles_dir)?;
 
-    let profile_dir = profiles_dir.join(profile_name);
+    if let Some(account_id) = auth::get_account_id(&auth) {
+        for entry in fs::read_dir(&profiles_dir)? {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let existing_name = entry.file_name().to_string_lossy().to_string();
+            let existing_auth_file = entry.path().join("auth.json");
+            let existing_auth = fs::read_to_string(&existing_auth_file)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<AuthDotJson>(&contents).ok());
+            let Some(existing_auth) = existing_auth else {
+                continue;
+            };
+            if auth::get_account_id(&existing_auth).as_deref() != Some(account_id.as_str()) {
+                continue;
+            }
 
-    // Check if profile already exists
+            let incoming_fp = token_fingerprint(&auth);
+            let existing_fp = token_fingerprint(&existing_auth);
+            if incoming_fp == existing_fp {
+                save_current_profile(&existing_name)?;
+                return Ok(SaveProfileOutcome::AlreadyExists {
+                    name: existing_name,
+                });
+            }
+
+            fs::write(&existing_auth_file, serde_json::to_string_pretty(&auth)?)?;
+            save_current_profile(&existing_name)?;
+            return Ok(SaveProfileOutcome::Updated { name: existing_name });
+        }
+    }
+
+    let profile_dir = profiles_dir.join(profile_name);
     if profile_dir.exists() {
         anyhow::bail!("Profile '{}' already exists. Delete it first.", profile_name);
     }
 
-    // Create profile directory
     fs::create_dir(&profile_dir)?;
-
-    // Save auth to profile
     let profile_auth_file = profile_dir.join("auth.json");
-    let auth_json = serde_json::to_string_pretty(&auth)?;
-    fs::write(&profile_auth_file, auth_json)?;
+    fs::write(&profile_auth_file, serde_json::to_string_pretty(&auth)?)?;
 
-    // Set as current if no current profile
     if get_current_profile()?.is_none() {
         save_current_profile(profile_name)?;
     }
 
-    Ok(())
+    Ok(SaveProfileOutcome::Created {
+        name: profile_name.to_string(),
+    })
 }
 
 /// Delete a profile
