@@ -248,17 +248,31 @@ impl eframe::App for RouterApp {
                     ui.label(format!("Email: {}", quota.email));
                     ui.label(format!("Plan: {}", quota.plan_type));
                     if let Some(used) = quota.used_requests {
-                        ui.label(format!("Requests used: {}", used));
+                        let total = quota.total_requests.unwrap_or(100);
+                        let left = total.saturating_sub(used.min(total));
+                        ui.label(format!(
+                            "Primary window: {}% used ({}% left)",
+                            used.min(total),
+                            left
+                        ));
                     } else {
-                        ui.label("Requests used: -");
+                        ui.label("Primary window: -");
                     }
+
                     if let Some(used) = quota.used_tokens {
-                        ui.label(format!("Tokens used: {}", used));
+                        let total = quota.total_tokens.unwrap_or(100);
+                        let left = total.saturating_sub(used.min(total));
+                        ui.label(format!(
+                            "Secondary window: {}% used ({}% left)",
+                            used.min(total),
+                            left
+                        ));
                     } else {
-                        ui.label("Tokens used: -");
+                        ui.label("Secondary window: -");
                     }
+
                     if let Some(reset) = &quota.reset_date {
-                        ui.label(format!("Reset: {}", reset));
+                        ui.label(format!("Primary reset: {}", reset));
                     }
                 } else {
                     ui.label("No quota data yet.");
