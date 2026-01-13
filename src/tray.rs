@@ -8,13 +8,11 @@ use crate::profile::ProfileSummary;
 #[derive(Debug, Clone)]
 pub enum TrayEvent {
     OpenWindow,
-    RefreshProfiles,
     SwitchProfile(String),
     Quit,
 }
 
 const OPEN_ID: &str = "open-window";
-const REFRESH_ID: &str = "refresh-profiles";
 const QUIT_ID: &str = "quit";
 const PROFILE_PREFIX: &str = "profile:";
 
@@ -36,24 +34,94 @@ impl TrayHandle {
 }
 
 fn default_icon() -> Icon {
-    let size = 16usize;
+    let size = 32usize;
     let mut rgba = vec![0u8; size * size * 4];
 
-    for y in 0..size {
-        for x in 0..size {
-            let idx = (y * size + x) * 4;
-            let is_border = x == 0 || y == 0 || x == size - 1 || y == size - 1;
-            let (r, g, b, a) = if is_border {
-                (20, 20, 20, 255)
-            } else {
-                (64, 132, 204, 255)
-            };
-            rgba[idx] = r;
-            rgba[idx + 1] = g;
-            rgba[idx + 2] = b;
-            rgba[idx + 3] = a;
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: f32,
+        y: f32,
+    }
+
+    fn dist_sq(a: Point, b: Point) -> f32 {
+        let dx = a.x - b.x;
+        let dy = a.y - b.y;
+        dx * dx + dy * dy
+    }
+
+    fn dist_sq_to_segment(p: Point, a: Point, b: Point) -> f32 {
+        let ab = Point {
+            x: b.x - a.x,
+            y: b.y - a.y,
+        };
+        let ap = Point {
+            x: p.x - a.x,
+            y: p.y - a.y,
+        };
+        let ab_len_sq = ab.x * ab.x + ab.y * ab.y;
+        if ab_len_sq <= f32::EPSILON {
+            return dist_sq(p, a);
+        }
+
+        let mut t = (ap.x * ab.x + ap.y * ab.y) / ab_len_sq;
+        t = t.clamp(0.0, 1.0);
+        let closest = Point {
+            x: a.x + ab.x * t,
+            y: a.y + ab.y * t,
+        };
+        dist_sq(p, closest)
+    }
+
+    fn draw_circle(rgba: &mut [u8], size: usize, center: Point, radius: f32) {
+        let r_sq = radius * radius;
+        for y in 0..size {
+            for x in 0..size {
+                let p = Point {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                };
+                if dist_sq(p, center) <= r_sq {
+                    let idx = (y * size + x) * 4;
+                    rgba[idx] = 0;
+                    rgba[idx + 1] = 0;
+                    rgba[idx + 2] = 0;
+                    rgba[idx + 3] = 255;
+                }
+            }
         }
     }
+
+    fn draw_line(rgba: &mut [u8], size: usize, start: Point, end: Point, thickness: f32) {
+        let threshold = (thickness / 2.0) * (thickness / 2.0);
+        for y in 0..size {
+            for x in 0..size {
+                let p = Point {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                };
+                if dist_sq_to_segment(p, start, end) <= threshold {
+                    let idx = (y * size + x) * 4;
+                    rgba[idx] = 0;
+                    rgba[idx + 1] = 0;
+                    rgba[idx + 2] = 0;
+                    rgba[idx + 3] = 255;
+                }
+            }
+        }
+    }
+
+    let hub = Point { x: 16.0, y: 16.0 };
+    let top_left = Point { x: 9.0, y: 11.0 };
+    let top_right = Point { x: 23.0, y: 11.0 };
+    let bottom = Point { x: 16.0, y: 25.0 };
+
+    draw_line(&mut rgba, size, hub, top_left, 3.0);
+    draw_line(&mut rgba, size, hub, top_right, 3.0);
+    draw_line(&mut rgba, size, hub, bottom, 3.0);
+    draw_circle(&mut rgba, size, hub, 3.2);
+    draw_circle(&mut rgba, size, top_left, 2.6);
+    draw_circle(&mut rgba, size, top_right, 2.6);
+    draw_circle(&mut rgba, size, bottom, 2.6);
 
     Icon::from_rgba(rgba, size as u32, size as u32)
         .expect("failed to build tray icon")
@@ -82,10 +150,6 @@ fn menu_entries(profiles: &[ProfileSummary]) -> Vec<MenuEntry> {
     entries.push(MenuEntry::Item {
         id: OPEN_ID.to_string(),
         label: "Open Window".to_string(),
-    });
-    entries.push(MenuEntry::Item {
-        id: REFRESH_ID.to_string(),
-        label: "Refresh Profiles".to_string(),
     });
 
     if !profiles.is_empty() {
@@ -116,9 +180,6 @@ fn tray_event_from_menu_id(id: &MenuId) -> Option<TrayEvent> {
     let id = id.as_ref();
     if id == OPEN_ID {
         return Some(TrayEvent::OpenWindow);
-    }
-    if id == REFRESH_ID {
-        return Some(TrayEvent::RefreshProfiles);
     }
     if id == QUIT_ID {
         return Some(TrayEvent::Quit);
@@ -154,6 +215,7 @@ pub fn start_tray(sender: Sender<TrayEvent>) -> TrayHandle {
         .with_menu(Box::new(menu))
         .with_tooltip("Codex Router")
         .with_icon(default_icon())
+        .with_icon_as_template(true)
         .build()
         .expect("failed to create tray icon");
 
@@ -193,9 +255,6 @@ mod tests {
     fn maps_menu_id_to_tray_event() {
         let open = tray_event_from_menu_id(&MenuId::new(OPEN_ID));
         assert!(matches!(open, Some(TrayEvent::OpenWindow)));
-
-        let refresh = tray_event_from_menu_id(&MenuId::new(REFRESH_ID));
-        assert!(matches!(refresh, Some(TrayEvent::RefreshProfiles)));
 
         let quit = tray_event_from_menu_id(&MenuId::new(QUIT_ID));
         assert!(matches!(quit, Some(TrayEvent::Quit)));

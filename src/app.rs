@@ -69,7 +69,6 @@ impl RouterApp {
 
 fn command_for_tray_event(event: &TrayEvent) -> Option<AppCommand> {
     match event {
-        TrayEvent::RefreshProfiles => Some(AppCommand::LoadProfiles),
         TrayEvent::SwitchProfile(name) => Some(AppCommand::SwitchProfile(name.clone())),
         _ => None,
     }
@@ -390,9 +389,6 @@ mod tests {
 
     #[test]
     fn tray_event_maps_to_app_command() {
-        let refresh = command_for_tray_event(&TrayEvent::RefreshProfiles);
-        assert!(matches!(refresh, Some(AppCommand::LoadProfiles)));
-
         let switch = command_for_tray_event(&TrayEvent::SwitchProfile("alpha".to_string()));
         match switch {
             Some(AppCommand::SwitchProfile(name)) => assert_eq!(name, "alpha"),
