@@ -17,6 +17,9 @@ Cargo.lock
 # Debug
 debug/
 
+# Packaging outputs
+dist/
+
 # Worktrees
 .worktrees
 .worktrees/
