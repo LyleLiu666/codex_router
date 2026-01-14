@@ -27,6 +27,7 @@ pub struct QuotaInfo {
     pub used_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub reset_date: Option<String>,
+    pub secondary_reset_date: Option<String>,
 }
 
 impl QuotaInfo {
@@ -71,6 +72,8 @@ struct CodexRateLimitWindowSnapshot {
     used_percent: Option<f64>,
     #[serde(default)]
     reset_at: Option<CodexResetAt>,
+    #[serde(default)]
+    reset_after_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,7 +233,16 @@ fn codex_payload_to_quota_info(auth: &auth::AuthDotJson, payload: CodexUsagePayl
         .rate_limit
         .as_ref()
         .and_then(|limit| limit.primary_window.as_ref())
-        .and_then(|window| window.reset_at.as_ref().map(CodexResetAt::as_rfc3339));
+        .and_then(|window| {
+            calculate_reset_time(window.reset_at.as_ref(), window.reset_after_seconds)
+        });
+    let secondary_reset_date = payload
+        .rate_limit
+        .as_ref()
+        .and_then(|limit| limit.secondary_window.as_ref())
+        .and_then(|window| {
+            calculate_reset_time(window.reset_at.as_ref(), window.reset_after_seconds)
+        });
 
     let plan_type = payload
         .plan_type
@@ -247,6 +259,7 @@ fn codex_payload_to_quota_info(auth: &auth::AuthDotJson, payload: CodexUsagePayl
         used_tokens: secondary_used,
         total_tokens: secondary_used.map(|_| 100),
         reset_date,
+        secondary_reset_date,
     }
 }
 
@@ -308,6 +321,19 @@ fn should_fallback_on_unauthorized(body: &str) -> bool {
     body.contains("\"invalid_api_key\"") || body.contains("Incorrect API key provided")
 }
 
+fn calculate_reset_time(
+    reset_at: Option<&CodexResetAt>,
+    reset_after_seconds: Option<i64>,
+) -> Option<String> {
+    if let Some(seconds) = reset_after_seconds {
+        let now = Utc::now();
+        let future = now + chrono::Duration::seconds(seconds);
+        return Some(future.to_rfc3339_opts(SecondsFormat::Secs, true));
+    }
+
+    reset_at.map(CodexResetAt::as_rfc3339)
+}
+
 fn epoch_seconds_to_rfc3339(raw: i64) -> String {
     let seconds = if raw >= 1_000_000_000_000 {
         raw / 1000
@@ -341,6 +367,7 @@ fn parse_quota_response(auth: &auth::AuthDotJson, data: &serde_json::Value) -> R
         used_tokens: data["data"]["usage"][0]["n_tokens"].as_u64(),
         total_tokens: None,
         reset_date: None,
+        secondary_reset_date: None,
     })
 }
 
@@ -355,6 +382,7 @@ fn get_fallback_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
         used_tokens: None,
         total_tokens: None,
         reset_date: None,
+        secondary_reset_date: None,
     })
 }
 
@@ -454,7 +482,7 @@ mod tests {
             }
             let _ = req_tx.send(String::from_utf8_lossy(&buf).to_string());
 
-            let body = r#"{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":25.0,"limit_window_seconds":3600,"reset_after_seconds":120,"reset_at":"2026-01-13T00:00:00Z"},"secondary_window":{"used_percent":10.0,"limit_window_seconds":86400,"reset_after_seconds":3600,"reset_at":"2026-01-14T00:00:00Z"}},"credits":{"has_credits":true,"unlimited":false,"balance":"12.34"}}"#;
+            let body = r#"{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":25.0,"limit_window_seconds":3600,"reset_at":"2026-01-13T00:00:00Z"},"secondary_window":{"used_percent":10.0,"limit_window_seconds":86400,"reset_at":"2026-01-14T00:00:00Z"}},"credits":{"has_credits":true,"unlimited":false,"balance":"12.34"}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -601,7 +629,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            let body = r#"{"plan_type":"team","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":19,"limit_window_seconds":18000,"reset_after_seconds":11867,"reset_at":1735689600},"secondary_window":{"used_percent":10,"limit_window_seconds":86400,"reset_after_seconds":3600,"reset_at":1735689600}}}"#;
+            let body = r#"{"plan_type":"team","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":19,"limit_window_seconds":18000,"reset_at":1735689600},"secondary_window":{"used_percent":10,"limit_window_seconds":86400,"reset_at":1735689600}}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -633,5 +661,20 @@ mod tests {
         assert_eq!(quota.reset_date.as_deref(), Some("2025-01-01T00:00:00Z"));
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn calculates_reset_time_from_reset_after_seconds() {
+        let reset_at = Some(CodexResetAt::EpochSeconds(1000));
+        let reset_after_seconds = Some(3600);
+
+        let result = calculate_reset_time(reset_at.as_ref(), reset_after_seconds);
+        assert!(result.is_some());
+
+        // Check if the time is roughly 1 hour from now
+        let parsed = DateTime::parse_from_rfc3339(&result.unwrap()).unwrap();
+        let now = Utc::now();
+        let diff = parsed.with_timezone(&Utc) - now;
+        assert!(diff.num_seconds() > 3590 && diff.num_seconds() < 3610);
     }
 }

@@ -13,6 +13,7 @@ pub enum AppCommand {
     RunLogin,
     OpenLoginUrl(String),
     FetchQuota,
+    FetchProfileQuota(String),
     Shutdown,
 }
 
@@ -30,6 +31,7 @@ pub enum AppEvent {
         message: String,
     },
     QuotaLoaded(QuotaInfo),
+    ProfileQuotaLoaded { name: String, quota: QuotaInfo },
     Error(String),
 }
 
@@ -83,6 +85,11 @@ impl AppState {
             AppEvent::QuotaLoaded(quota) => {
                 self.quota = Some(quota);
                 self.last_updated = Some(Utc::now());
+            }
+            AppEvent::ProfileQuotaLoaded { name, quota } => {
+                if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == name) {
+                    profile.quota = Some(quota);
+                }
             }
             AppEvent::ProfileSaved(outcome) => {
                 self.profile_message = Some(match outcome {

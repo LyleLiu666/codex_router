@@ -2,6 +2,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Local};
 use eframe::egui;
 
 use crate::app_state::{AppCommand, AppEvent, AppState};
@@ -95,6 +96,23 @@ fn should_fetch_on_profile_change(prev: Option<&str>, next: Option<&str>) -> boo
         (None, Some(_)) => true,
         (Some(_), None) => false,
     }
+}
+
+fn format_reset_time(utc_str: Option<&str>) -> String {
+    let Some(utc_str) = utc_str else {
+        return "-".to_string();
+    };
+
+    // Parse the UTC time string
+    let Ok(utc_time) = DateTime::parse_from_rfc3339(utc_str) else {
+        return utc_str.to_string();
+    };
+
+    // Convert to local time
+    let local_time = utc_time.with_timezone(&Local);
+    
+    // Format as "YYYY-MM-DD HH:MM (local)"
+    local_time.format("%Y-%m-%d %H:%M (local)").to_string()
 }
 
 fn apply_router_state(app_state: &mut AppState, router_state: &RouterState) {
@@ -253,6 +271,9 @@ impl eframe::App for RouterApp {
                         };
                         ui.strong(&profile_label);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("⟳").clicked() {
+                                let _ = self.cmd_tx.send(AppCommand::FetchProfileQuota(profile.name.clone()));
+                            }
                             if profile.is_current {
                                 ui.add_enabled(false, egui::Button::new("Current"));
                             } else if ui.button("Switch").clicked() {
@@ -294,8 +315,12 @@ impl eframe::App for RouterApp {
                                 });
                                 ui.end_row();
 
-                                ui.label("Reset");
-                                ui.label(quota.reset_date.as_deref().unwrap_or("-"));
+                                ui.label("Reset (Primary)");
+                                ui.label(format_reset_time(quota.reset_date.as_deref()));
+                                ui.end_row();
+
+                                ui.label("Reset (Secondary)");
+                                ui.label(format_reset_time(quota.secondary_reset_date.as_deref()));
                                 ui.end_row();
                             });
                     } else {
@@ -373,6 +398,9 @@ impl eframe::App for RouterApp {
         if self.state.auto_refresh_enabled {
             ctx.request_repaint_after(interval);
         }
+
+        // Always request periodic repaint to handle tray events even when window is hidden
+        ctx.request_repaint_after(Duration::from_millis(500));
     }
 }
 

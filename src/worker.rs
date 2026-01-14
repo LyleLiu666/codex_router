@@ -134,6 +134,23 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                         }
                     };
                 }
+                AppCommand::FetchProfileQuota(name) => {
+                    match profile::load_profile_auth(&name) {
+                        Ok(auth) => {
+                            match runtime.block_on(api::fetch_quota(&auth)) {
+                                Ok(quota) => {
+                                    let _ = evt_tx.send(AppEvent::ProfileQuotaLoaded { name, quota });
+                                }
+                                Err(err) => {
+                                    let _ = evt_tx.send(AppEvent::Error(format!("Failed to fetch quota for {}: {}", name, err)));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let _ = evt_tx.send(AppEvent::Error(format!("Failed to load profile {}: {}", name, err)));
+                        }
+                    }
+                }
                 AppCommand::RunLogin => {
                     let previous_auth_json = config::get_auth_file()
                         .ok()
@@ -526,5 +543,81 @@ mod tests {
             2,
             "expected the quota server to receive both profile requests"
         );
+    }
+
+    #[test]
+    fn fetch_profile_quota_updates_specific_profile() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _base_url_guard =
+            StringEnvGuard::set("CODEX_ROUTER_CHATGPT_BASE_URL", format!("http://{addr}"));
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            
+            // Try to accept connection until deadline
+            let (mut stream, _) = loop {
+                if std::time::Instant::now() > deadline {
+                     panic!("timed out waiting for connection");
+                }
+                match listener.accept() {
+                    Ok(v) => break v,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("accept failed: {}", e),
+                }
+            };
+
+             let mut buf = [0u8; 1024];
+             let _ = stream.read(&mut buf);
+             let body = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":50,"reset_at":1735689600},"secondary_window":{"used_percent":50,"reset_at":1735689600}}}"#;
+             let response = format!(
+                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                 body.len(),
+                 body
+             );
+             stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("alpha")).unwrap();
+        // Mock valid auth
+        let jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImFscGhhQGV4YW1wbGUuY29tIiwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9hbHBoYSJ9fQ.sig";
+        let auth = auth::AuthDotJson {
+             openai_api_key: None,
+             tokens: Some(auth::TokenData {
+                 id_token: Some(auth::IdToken::Raw(jwt.to_string())),
+                 access_token: "access".to_string(),
+                 refresh_token: "refresh".to_string(),
+                 account_id: Some("acct_alpha".to_string()),
+             }),
+             last_refresh: None,
+        };
+        fs::write(profiles_dir.join("alpha").join("auth.json"), serde_json::to_string(&auth).unwrap()).unwrap();
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let handle = start_worker(cmd_rx, evt_tx);
+
+        cmd_tx.send(AppCommand::FetchProfileQuota("alpha".to_string())).unwrap();
+
+        let event = evt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        match event {
+            AppEvent::ProfileQuotaLoaded { name, quota } => {
+                assert_eq!(name, "alpha");
+                assert_eq!(quota.used_requests, Some(50));
+            }
+            _ => panic!("unexpected event: {:?}", event),
+        }
+
+        cmd_tx.send(AppCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+        server.join().unwrap();
     }
 }
