@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -49,11 +50,27 @@ struct CodexRateLimitStatus {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum CodexResetAt {
+    IsoString(String),
+    EpochSeconds(i64),
+}
+
+impl CodexResetAt {
+    fn as_rfc3339(&self) -> String {
+        match self {
+            CodexResetAt::IsoString(value) => value.clone(),
+            CodexResetAt::EpochSeconds(value) => epoch_seconds_to_rfc3339(*value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct CodexRateLimitWindowSnapshot {
     #[serde(default)]
     used_percent: Option<f64>,
     #[serde(default)]
-    reset_at: Option<String>,
+    reset_at: Option<CodexResetAt>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,7 +230,7 @@ fn codex_payload_to_quota_info(auth: &auth::AuthDotJson, payload: CodexUsagePayl
         .rate_limit
         .as_ref()
         .and_then(|limit| limit.primary_window.as_ref())
-        .and_then(|window| window.reset_at.clone());
+        .and_then(|window| window.reset_at.as_ref().map(CodexResetAt::as_rfc3339));
 
     let plan_type = payload
         .plan_type
@@ -289,6 +306,18 @@ fn default_user_agent() -> String {
 
 fn should_fallback_on_unauthorized(body: &str) -> bool {
     body.contains("\"invalid_api_key\"") || body.contains("Incorrect API key provided")
+}
+
+fn epoch_seconds_to_rfc3339(raw: i64) -> String {
+    let seconds = if raw >= 1_000_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    };
+
+    DateTime::<Utc>::from_timestamp(seconds, 0)
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| seconds.to_string())
 }
 
 fn body_preview(bytes: &[u8]) -> String {
@@ -560,6 +589,48 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(&url), "missing url: {msg}");
+
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_quota_parses_codex_usage_with_epoch_reset_at() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"plan_type":"team","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":19,"limit_window_seconds":18000,"reset_after_seconds":11867,"reset_at":1735689600},"secondary_window":{"used_percent":10,"limit_window_seconds":86400,"reset_after_seconds":3600,"reset_at":1735689600}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: None,
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/codex/usage", addr);
+
+        let quota = fetch_quota_with_client(&client, &auth, &url).await.unwrap();
+        assert_eq!(quota.plan_type, "team");
+        assert_eq!(quota.used_requests, Some(19));
+        assert_eq!(quota.reset_date.as_deref(), Some("2025-01-01T00:00:00Z"));
 
         server.join().unwrap();
     }
