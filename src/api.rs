@@ -10,6 +10,8 @@ use crate::auth;
 const DEFAULT_USAGE_URL: &str = "https://api.openai.com/v1/usage";
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CODEX_USAGE_PATH: &str = "/api/codex/usage";
+const CODEX_USAGE_FALLBACK_PATH: &str = "/codex/usage";
+const DEFAULT_CHATGPT_FALLBACK_BASE_URL: &str = "https://chat.openai.com/backend-api";
 const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 
 /// Quota information
@@ -79,13 +81,24 @@ pub async fn fetch_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let url = if auth.tokens.is_some() {
-        join_url(&chatgpt_base_url(), CODEX_USAGE_PATH)
-    } else {
-        DEFAULT_USAGE_URL.to_string()
-    };
+    if auth.tokens.is_some() && auth.openai_api_key.is_none() {
+        let mut last_error: Option<anyhow::Error> = None;
+        for url in codex_usage_urls() {
+            match fetch_quota_with_client(&client, auth, &url).await {
+                Ok(quota) => return Ok(quota),
+                Err(err) => {
+                    tracing::warn!(url = %url, error = %err, "quota request failed");
+                    last_error = Some(err);
+                }
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        anyhow::bail!("No quota endpoints configured");
+    }
 
-    fetch_quota_with_client(&client, auth, &url).await
+    fetch_quota_with_client(&client, auth, DEFAULT_USAGE_URL).await
 }
 
 /// Watch quota with auto-refresh (deprecated in UI mode)
@@ -120,6 +133,7 @@ async fn fetch_quota_with_client(
         request = request
             .header("originator", DEFAULT_ORIGINATOR)
             .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::USER_AGENT, default_user_agent());
     }
 
@@ -138,14 +152,22 @@ async fn fetch_quota_with_client(
         Ok(resp) => {
             let status = resp.status();
             let error = resp.text().await.unwrap_or_default();
-            if status == StatusCode::UNAUTHORIZED && auth.openai_api_key.is_none() && auth.tokens.is_some() {
+            if status == StatusCode::UNAUTHORIZED
+                && auth.openai_api_key.is_none()
+                && auth.tokens.is_some()
+                && should_fallback_on_unauthorized(&error)
+            {
                 return get_fallback_quota(auth);
             }
-            anyhow::bail!("API returned status {}: {}", status, error);
+            anyhow::bail!(
+                "API returned status {} for {}: {}",
+                status,
+                url,
+                error
+            );
         }
-        Err(_e) => {
-            // If the quota endpoint doesn't work, return a mock response based on auth data
-            get_fallback_quota(auth)
+        Err(e) => {
+            anyhow::bail!("API request failed for {}: {}", url, e);
         }
     }
 }
@@ -204,6 +226,31 @@ fn chatgpt_base_url() -> String {
     env::var("CODEX_ROUTER_CHATGPT_BASE_URL").unwrap_or_else(|_| DEFAULT_CHATGPT_BASE_URL.to_string())
 }
 
+fn codex_usage_urls() -> Vec<String> {
+    let configured = env::var("CODEX_ROUTER_CHATGPT_BASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let base_urls = if let Some(configured) = configured {
+        vec![configured]
+    } else {
+        vec![
+            DEFAULT_CHATGPT_BASE_URL.to_string(),
+            DEFAULT_CHATGPT_FALLBACK_BASE_URL.to_string(),
+        ]
+    };
+
+    let mut urls = Vec::new();
+    for base in base_urls {
+        urls.push(join_url(&base, CODEX_USAGE_PATH));
+        urls.push(join_url(&base, CODEX_USAGE_FALLBACK_PATH));
+    }
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
 fn join_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = path.trim_start_matches('/');
@@ -217,6 +264,10 @@ fn default_user_agent() -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     )
+}
+
+fn should_fallback_on_unauthorized(body: &str) -> bool {
+    body.contains("\"invalid_api_key\"") || body.contains("Incorrect API key provided")
 }
 
 /// Parse quota API response
@@ -390,6 +441,50 @@ mod tests {
         assert_eq!(quota.used_tokens, Some(10));
         assert_eq!(quota.total_tokens, Some(100));
         assert_eq!(quota.reset_date.as_deref(), Some("2026-01-13T00:00:00Z"));
+
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_quota_includes_url_in_error_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"detail":"Not Found"}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: None,
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/api/codex/usage", addr);
+
+        let err = fetch_quota_with_client(&client, &auth, &url)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&url), "missing url: {msg}");
+        assert!(msg.contains("404"), "missing status: {msg}");
 
         server.join().unwrap();
     }
