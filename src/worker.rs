@@ -2,10 +2,57 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
+use std::{fs, path::Path};
 
 use crate::app_state::{AppCommand, AppEvent};
+use crate::config;
 use crate::login_output;
 use crate::{api, auth, profile};
+
+fn read_existing_auth_json(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn finalize_login(previous_auth_json: Option<String>) -> anyhow::Result<()> {
+    let new_auth = auth::load_auth()?;
+    let outcome = profile::save_auth_as_profile_without_switch(&new_auth)?;
+
+    let name = match &outcome {
+        profile::SaveProfileOutcome::Created { name }
+        | profile::SaveProfileOutcome::Updated { name }
+        | profile::SaveProfileOutcome::AlreadyExists { name } => name.clone(),
+    };
+
+    let auth_file = config::get_auth_file()?;
+    if let Some(parent) = auth_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match previous_auth_json {
+        Some(previous) => {
+            fs::write(auth_file, previous)?;
+        }
+        None => {
+            let current_profile_file = config::get_current_profile_file()?;
+            let needs_current_profile = match fs::read_to_string(&current_profile_file) {
+                Ok(contents) => contents.trim().is_empty(),
+                Err(_) => true,
+            };
+            if needs_current_profile {
+                if let Some(parent) = current_profile_file.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&current_profile_file, &name)?;
+            }
+            fs::write(auth_file, serde_json::to_string_pretty(&new_auth)?)?;
+        }
+    }
+
+    Ok(())
+}
 
 pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -74,6 +121,10 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                     }
                 }
                 AppCommand::RunLogin => {
+                    let previous_auth_json = config::get_auth_file()
+                        .ok()
+                        .and_then(|path| read_existing_auth_json(&path));
+
                     let evt_tx = evt_tx.clone();
                     std::thread::spawn(move || {
                         let _ = evt_tx.send(AppEvent::LoginOutput {
@@ -159,6 +210,11 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                         });
 
                         if success {
+                            if let Err(err) = finalize_login(previous_auth_json) {
+                                let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                                return;
+                            }
+
                             if let Ok(profiles) = profile::list_profiles_data() {
                                 let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                             }
@@ -221,5 +277,69 @@ mod tests {
 
         cmd_tx.send(AppCommand::Shutdown).unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn finalize_login_adds_profile_without_switching_current() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let old_jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im9sZEBleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyIsImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3Rfb2xkIn19.sig";
+        let old_auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: Some(auth::IdToken::Raw(old_jwt.to_string())),
+                access_token: "old-access".to_string(),
+                refresh_token: "old-refresh".to_string(),
+                account_id: Some("acct_old".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let new_jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im5ld0BleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InRlYW0iLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0X25ldyJ9fQ.sig";
+        let new_auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: Some(auth::IdToken::Raw(new_jwt.to_string())),
+                access_token: "new-access".to_string(),
+                refresh_token: "new-refresh".to_string(),
+                account_id: Some("acct_new".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("work")).unwrap();
+        fs::write(
+            profiles_dir.join("work").join("auth.json"),
+            serde_json::to_string_pretty(&old_auth).unwrap(),
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join(".current_profile"), "work").unwrap();
+
+        let auth_path = temp_dir.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&old_auth).unwrap(),
+        )
+        .unwrap();
+        let previous_auth_json = fs::read_to_string(&auth_path).unwrap();
+
+        fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&new_auth).unwrap(),
+        )
+        .unwrap();
+
+        let _ = finalize_login(Some(previous_auth_json)).unwrap();
+
+        let restored = fs::read_to_string(&auth_path).unwrap();
+        let restored_value: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        let expected_value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string_pretty(&old_auth).unwrap()).unwrap();
+        assert_eq!(restored_value, expected_value);
+        assert_eq!(fs::read_to_string(temp_dir.path().join(".current_profile")).unwrap(), "work");
+        assert!(profiles_dir.join("new").exists());
     }
 }

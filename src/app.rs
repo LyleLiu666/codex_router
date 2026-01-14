@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use crate::app_state::{AppCommand, AppEvent, AppState};
+use crate::profile::ProfileSummary;
 use crate::refresh::RefreshSchedule;
 use crate::state::{self, RouterState};
 use crate::tray::{self, TrayEvent, TrayHandle};
@@ -95,6 +96,10 @@ fn should_fetch_on_profile_change(prev: Option<&str>, next: Option<&str>) -> boo
         (None, Some(_)) => true,
         (Some(_), None) => false,
     }
+}
+
+fn switchable_profiles(profiles: &[ProfileSummary]) -> Vec<&ProfileSummary> {
+    profiles.iter().filter(|profile| !profile.is_current).collect()
 }
 
 fn apply_router_state(app_state: &mut AppState, router_state: &RouterState) {
@@ -189,6 +194,7 @@ impl eframe::App for RouterApp {
             ui.heading("Codex Router");
 
             ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
                 ui.label("Quota");
                 ui.horizontal(|ui| {
                     if ui.button("Refresh Quota").clicked() {
@@ -239,44 +245,75 @@ impl eframe::App for RouterApp {
                     }
                 });
 
-                if let Some(last_updated) = &self.state.last_updated {
-                    ui.label(format!("Last updated: {}", last_updated.to_rfc3339()));
-                }
+                egui::Grid::new("quota_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let profile_label = self
+                            .state
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.is_current)
+                            .map(|profile| match &profile.email {
+                                Some(email) => format!("{} ({})", profile.name, email),
+                                None => profile.name.clone(),
+                            })
+                            .unwrap_or_else(|| "-".to_string());
+                        ui.label("Profile");
+                        ui.label(profile_label);
+                        ui.end_row();
 
-                if let Some(quota) = &self.state.quota {
-                    ui.label(format!("Account: {}", quota.account_id));
-                    ui.label(format!("Email: {}", quota.email));
-                    ui.label(format!("Plan: {}", quota.plan_type));
-                    if let Some(used) = quota.used_requests {
-                        let total = quota.total_requests.unwrap_or(100);
-                        let left = total.saturating_sub(used.min(total));
-                        ui.label(format!(
-                            "Primary window: {}% used ({}% left)",
-                            used.min(total),
-                            left
-                        ));
-                    } else {
-                        ui.label("Primary window: -");
-                    }
+                        ui.label("Last updated");
+                        ui.label(
+                            self.state
+                                .last_updated
+                                .as_ref()
+                                .map(|ts| ts.to_rfc3339())
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        ui.end_row();
 
-                    if let Some(used) = quota.used_tokens {
-                        let total = quota.total_tokens.unwrap_or(100);
-                        let left = total.saturating_sub(used.min(total));
-                        ui.label(format!(
-                            "Secondary window: {}% used ({}% left)",
-                            used.min(total),
-                            left
-                        ));
-                    } else {
-                        ui.label("Secondary window: -");
-                    }
+                        if let Some(quota) = &self.state.quota {
+                            ui.label("Account");
+                            ui.label(&quota.account_id);
+                            ui.end_row();
 
-                    if let Some(reset) = &quota.reset_date {
-                        ui.label(format!("Primary reset: {}", reset));
-                    }
-                } else {
-                    ui.label("No quota data yet.");
-                }
+                            ui.label("Plan");
+                            ui.label(&quota.plan_type);
+                            ui.end_row();
+
+                            ui.label("Primary window");
+                            ui.label(match quota.used_requests {
+                                Some(used) => {
+                                    let total = quota.total_requests.unwrap_or(100);
+                                    let left = total.saturating_sub(used.min(total));
+                                    format!("{}% used ({}% left)", used.min(total), left)
+                                }
+                                None => "-".to_string(),
+                            });
+                            ui.end_row();
+
+                            ui.label("Secondary window");
+                            ui.label(match quota.used_tokens {
+                                Some(used) => {
+                                    let total = quota.total_tokens.unwrap_or(100);
+                                    let left = total.saturating_sub(used.min(total));
+                                    format!("{}% used ({}% left)", used.min(total), left)
+                                }
+                                None => "-".to_string(),
+                            });
+                            ui.end_row();
+
+                            ui.label("Primary reset");
+                            ui.label(quota.reset_date.as_deref().unwrap_or("-"));
+                            ui.end_row();
+                        } else {
+                            ui.label("Quota");
+                            ui.label("No quota data yet.");
+                            ui.end_row();
+                        }
+                    });
             });
 
             if let Some(error) = &self.state.error {
@@ -313,16 +350,14 @@ impl eframe::App for RouterApp {
                 ui.label("No profiles yet. Save current login or run codex login.");
             }
 
-            for profile in &self.state.profiles {
+            for profile in switchable_profiles(&self.state.profiles) {
                 ui.horizontal(|ui| {
                     ui.label(&profile.name);
                     if let Some(email) = &profile.email {
                         ui.label(email);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if profile.is_current {
-                            ui.add_enabled(false, egui::Button::new("Current"));
-                        } else if ui.button("Switch").clicked() {
+                        if ui.button("Switch").clicked() {
                             let _ = self
                                 .cmd_tx
                                 .send(AppCommand::SwitchProfile(profile.name.clone()));
@@ -425,6 +460,28 @@ mod tests {
         assert!(should_fetch_on_profile_change(Some("a"), Some("b")));
         assert!(!should_fetch_on_profile_change(Some("a"), Some("a")));
         assert!(!should_fetch_on_profile_change(None, None));
+    }
+
+    #[test]
+    fn switchable_profiles_excludes_current() {
+        use crate::profile::ProfileSummary;
+
+        let profiles = vec![
+            ProfileSummary {
+                name: "work".to_string(),
+                email: Some("work@example.com".to_string()),
+                is_current: true,
+            },
+            ProfileSummary {
+                name: "personal".to_string(),
+                email: Some("personal@example.com".to_string()),
+                is_current: false,
+            },
+        ];
+
+        let switchable = switchable_profiles(&profiles);
+        assert_eq!(switchable.len(), 1);
+        assert_eq!(switchable[0].name, "personal");
     }
 
     #[test]

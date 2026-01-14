@@ -330,6 +330,113 @@ pub fn save_profile(profile_name: &str) -> Result<SaveProfileOutcome> {
     })
 }
 
+/// Save the provided auth as a profile without switching the current profile.
+pub fn save_auth_as_profile_without_switch(auth: &AuthDotJson) -> Result<SaveProfileOutcome> {
+    let profiles_dir = get_profiles_dir()?;
+    fs::create_dir_all(&profiles_dir)?;
+
+    if let Some(account_id) = auth::get_account_id(auth) {
+        for entry in fs::read_dir(&profiles_dir)? {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let existing_name = entry.file_name().to_string_lossy().to_string();
+            let existing_auth_file = entry.path().join("auth.json");
+            let existing_auth = fs::read_to_string(&existing_auth_file)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<AuthDotJson>(&contents).ok());
+            let Some(existing_auth) = existing_auth else {
+                continue;
+            };
+            if auth::get_account_id(&existing_auth).as_deref() != Some(account_id.as_str()) {
+                continue;
+            }
+
+            let incoming_fp = token_fingerprint(auth);
+            let existing_fp = token_fingerprint(&existing_auth);
+            if incoming_fp == existing_fp {
+                return Ok(SaveProfileOutcome::AlreadyExists {
+                    name: existing_name,
+                });
+            }
+
+            fs::write(&existing_auth_file, serde_json::to_string_pretty(auth)?)?;
+            return Ok(SaveProfileOutcome::Updated { name: existing_name });
+        }
+    }
+
+    let base_name = suggested_profile_name(auth);
+    for attempt in 0..100 {
+        let candidate = if attempt == 0 {
+            base_name.clone()
+        } else {
+            format!("{base_name}-{}", attempt + 1)
+        };
+        let profile_dir = profiles_dir.join(&candidate);
+        if profile_dir.exists() {
+            continue;
+        }
+        fs::create_dir(&profile_dir)?;
+        let profile_auth_file = profile_dir.join("auth.json");
+        fs::write(&profile_auth_file, serde_json::to_string_pretty(auth)?)?;
+        return Ok(SaveProfileOutcome::Created { name: candidate });
+    }
+
+    anyhow::bail!("Failed to find available profile name starting with '{base_name}'");
+}
+
+fn suggested_profile_name(auth: &AuthDotJson) -> String {
+    let raw = auth::get_email(auth)
+        .and_then(|email| email.split('@').next().map(|value| value.to_string()))
+        .or_else(|| auth::get_account_id(auth))
+        .unwrap_or_else(|| "profile".to_string());
+    sanitize_profile_name(&raw)
+}
+
+fn sanitize_profile_name(input: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+
+    for ch in input.chars() {
+        let normalized = match ch {
+            'a'..='z' | '0'..='9' | '_' => Some(ch),
+            'A'..='Z' => Some(ch.to_ascii_lowercase()),
+            '-' => Some('-'),
+            _ => None,
+        };
+
+        match normalized {
+            Some('-') => {
+                if !prev_dash && !out.is_empty() {
+                    out.push('-');
+                }
+                prev_dash = true;
+            }
+            Some(ch) => {
+                out.push(ch);
+                prev_dash = false;
+            }
+            None => {
+                if !prev_dash && !out.is_empty() {
+                    out.push('-');
+                    prev_dash = true;
+                }
+            }
+        }
+    }
+
+    while out.ends_with('-') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "profile".to_string()
+    } else {
+        out
+    }
+}
+
 /// Delete a profile
 pub fn delete_profile(profile_name: &str) -> Result<()> {
     let profiles_dir = get_profiles_dir()?;
