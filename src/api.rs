@@ -13,6 +13,7 @@ const CODEX_USAGE_PATH: &str = "/api/codex/usage";
 const CODEX_USAGE_FALLBACK_PATH: &str = "/codex/usage";
 const DEFAULT_CHATGPT_FALLBACK_BASE_URL: &str = "https://chat.openai.com/backend-api";
 const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
+const DEFAULT_USER_AGENT: &str = "codex-cli";
 
 /// Quota information
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,18 +83,18 @@ pub async fn fetch_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
         .build()?;
 
     if auth.tokens.is_some() && auth.openai_api_key.is_none() {
-        let mut last_error: Option<anyhow::Error> = None;
+        let mut failures: Vec<String> = Vec::new();
         for url in codex_usage_urls() {
             match fetch_quota_with_client(&client, auth, &url).await {
                 Ok(quota) => return Ok(quota),
                 Err(err) => {
                     tracing::warn!(url = %url, error = %err, "quota request failed");
-                    last_error = Some(err);
+                    failures.push(err.to_string());
                 }
             }
         }
-        if let Some(err) = last_error {
-            return Err(err);
+        if !failures.is_empty() {
+            anyhow::bail!("All quota endpoints failed:\n{}", failures.join("\n"));
         }
         anyhow::bail!("No quota endpoints configured");
     }
@@ -128,7 +129,7 @@ async fn fetch_quota_with_client(
 
     if is_tokens_flow {
         if let Some(account_id) = account_id.as_deref() {
-            request = request.header("chatgpt-account-id", account_id);
+            request = request.header("ChatGPT-Account-Id", account_id);
         }
         request = request
             .header("originator", DEFAULT_ORIGINATOR)
@@ -142,7 +143,30 @@ async fn fetch_quota_with_client(
     match response {
         Ok(resp) if resp.status().is_success() => {
             if is_tokens_flow {
-                let payload: CodexUsagePayload = resp.json().await?;
+                let status = resp.status();
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string();
+                let bytes = resp.bytes().await.with_context(|| {
+                    format!(
+                        "Failed to read response body from {} (status {}, content-type {})",
+                        url, status, content_type
+                    )
+                })?;
+                let payload: CodexUsagePayload = serde_json::from_slice(&bytes).map_err(|err| {
+                    let preview = body_preview(&bytes);
+                    anyhow::anyhow!(
+                        "Failed to parse JSON from {} (status {}, content-type {}): {}. Body preview: {}",
+                        url,
+                        status,
+                        content_type,
+                        err,
+                        preview
+                    )
+                })?;
                 Ok(codex_payload_to_quota_info(auth, payload))
             } else {
                 let data: serde_json::Value = resp.json().await?;
@@ -243,11 +267,13 @@ fn codex_usage_urls() -> Vec<String> {
 
     let mut urls = Vec::new();
     for base in base_urls {
-        urls.push(join_url(&base, CODEX_USAGE_PATH));
-        urls.push(join_url(&base, CODEX_USAGE_FALLBACK_PATH));
+        for path in [CODEX_USAGE_PATH, CODEX_USAGE_FALLBACK_PATH] {
+            let url = join_url(&base, path);
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
     }
-    urls.sort();
-    urls.dedup();
     urls
 }
 
@@ -258,16 +284,21 @@ fn join_url(base: &str, path: &str) -> String {
 }
 
 fn default_user_agent() -> String {
-    format!(
-        "codex_router/{} ({}/{})",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
+    env::var("CODEX_ROUTER_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string())
 }
 
 fn should_fallback_on_unauthorized(body: &str) -> bool {
     body.contains("\"invalid_api_key\"") || body.contains("Incorrect API key provided")
+}
+
+fn body_preview(bytes: &[u8]) -> String {
+    let preview_len = bytes.len().min(256);
+    let preview = String::from_utf8_lossy(&bytes[..preview_len]);
+    preview
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .trim()
+        .to_string()
 }
 
 /// Parse quota API response
@@ -433,6 +464,7 @@ mod tests {
         assert!(request.contains("authorization: bearer access"));
         assert!(request.contains("chatgpt-account-id: acct_123"));
         assert!(request.contains("originator: codex_cli_rs"));
+        assert!(request.contains("user-agent: codex-cli"));
 
         assert_eq!(quota.account_id, "acct_123");
         assert_eq!(quota.plan_type, "pro (credits: 12.34)");
@@ -485,6 +517,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains(&url), "missing url: {msg}");
         assert!(msg.contains("404"), "missing status: {msg}");
+
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_quota_includes_url_when_json_decode_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = "not-json";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: None,
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/api/codex/usage", addr);
+
+        let err = fetch_quota_with_client(&client, &auth, &url)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&url), "missing url: {msg}");
 
         server.join().unwrap();
     }
