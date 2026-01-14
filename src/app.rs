@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use crate::app_state::{AppCommand, AppEvent, AppState};
-use crate::profile::ProfileSummary;
 use crate::refresh::RefreshSchedule;
 use crate::state::{self, RouterState};
 use crate::tray::{self, TrayEvent, TrayHandle};
@@ -96,10 +95,6 @@ fn should_fetch_on_profile_change(prev: Option<&str>, next: Option<&str>) -> boo
         (None, Some(_)) => true,
         (Some(_), None) => false,
     }
-}
-
-fn switchable_profiles(profiles: &[ProfileSummary]) -> Vec<&ProfileSummary> {
-    profiles.iter().filter(|profile| !profile.is_current).collect()
 }
 
 fn apply_router_state(app_state: &mut AppState, router_state: &RouterState) {
@@ -195,9 +190,9 @@ impl eframe::App for RouterApp {
 
             ui.group(|ui| {
                 ui.set_min_width(ui.available_width());
-                ui.label("Quota");
                 ui.horizontal(|ui| {
-                    if ui.button("Refresh Quota").clicked() {
+                    ui.label("Profiles");
+                    if ui.button("Refresh").clicked() {
                         let _ = self.cmd_tx.send(AppCommand::FetchQuota);
                         self.quota_refresh.clear();
                     }
@@ -226,7 +221,7 @@ impl eframe::App for RouterApp {
                     let mut interval_minutes = (self.state.refresh_interval_seconds / 60).max(1);
                     let response = ui.add(
                         egui::DragValue::new(&mut interval_minutes)
-                            .clamp_range(1..=120)
+                            .range(1..=120)
                             .suffix(" min"),
                     );
                     if response.changed() {
@@ -245,75 +240,68 @@ impl eframe::App for RouterApp {
                     }
                 });
 
-                egui::Grid::new("quota_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 4.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        let profile_label = self
-                            .state
-                            .profiles
-                            .iter()
-                            .find(|profile| profile.is_current)
-                            .map(|profile| match &profile.email {
-                                Some(email) => format!("{} ({})", profile.name, email),
-                                None => profile.name.clone(),
-                            })
-                            .unwrap_or_else(|| "-".to_string());
-                        ui.label("Profile");
-                        ui.label(profile_label);
-                        ui.end_row();
+                if self.state.profiles.is_empty() {
+                    ui.label("No profiles yet. Save current login or run codex login.");
+                }
 
-                        ui.label("Last updated");
-                        ui.label(
-                            self.state
-                                .last_updated
-                                .as_ref()
-                                .map(|ts| ts.to_rfc3339())
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                        ui.end_row();
-
-                        if let Some(quota) = &self.state.quota {
-                            ui.label("Account");
-                            ui.label(&quota.account_id);
-                            ui.end_row();
-
-                            ui.label("Plan");
-                            ui.label(&quota.plan_type);
-                            ui.end_row();
-
-                            ui.label("Primary window");
-                            ui.label(match quota.used_requests {
-                                Some(used) => {
-                                    let total = quota.total_requests.unwrap_or(100);
-                                    let left = total.saturating_sub(used.min(total));
-                                    format!("{}% used ({}% left)", used.min(total), left)
-                                }
-                                None => "-".to_string(),
-                            });
-                            ui.end_row();
-
-                            ui.label("Secondary window");
-                            ui.label(match quota.used_tokens {
-                                Some(used) => {
-                                    let total = quota.total_tokens.unwrap_or(100);
-                                    let left = total.saturating_sub(used.min(total));
-                                    format!("{}% used ({}% left)", used.min(total), left)
-                                }
-                                None => "-".to_string(),
-                            });
-                            ui.end_row();
-
-                            ui.label("Primary reset");
-                            ui.label(quota.reset_date.as_deref().unwrap_or("-"));
-                            ui.end_row();
-                        } else {
-                            ui.label("Quota");
-                            ui.label("No quota data yet.");
-                            ui.end_row();
-                        }
+                for profile in &self.state.profiles {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let profile_label = match &profile.email {
+                            Some(email) => format!("{} ({})", profile.name, email),
+                            None => profile.name.clone(),
+                        };
+                        ui.strong(&profile_label);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if profile.is_current {
+                                ui.add_enabled(false, egui::Button::new("Current"));
+                            } else if ui.button("Switch").clicked() {
+                                let _ = self
+                                    .cmd_tx
+                                    .send(AppCommand::SwitchProfile(profile.name.clone()));
+                            }
+                        });
                     });
+
+                    if let Some(quota) = &profile.quota {
+                        egui::Grid::new(format!("quota_grid_{}", profile.name))
+                            .num_columns(2)
+                            .spacing([10.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Plan");
+                                ui.label(&quota.plan_type);
+                                ui.end_row();
+
+                                ui.label("Primary");
+                                ui.label(match quota.used_requests {
+                                    Some(used) => {
+                                        let total = quota.total_requests.unwrap_or(100);
+                                        let left = total.saturating_sub(used.min(total));
+                                        format!("{}% used ({}% left)", used.min(total), left)
+                                    }
+                                    None => "-".to_string(),
+                                });
+                                ui.end_row();
+
+                                ui.label("Secondary");
+                                ui.label(match quota.used_tokens {
+                                    Some(used) => {
+                                        let total = quota.total_tokens.unwrap_or(100);
+                                        let left = total.saturating_sub(used.min(total));
+                                        format!("{}% used ({}% left)", used.min(total), left)
+                                    }
+                                    None => "-".to_string(),
+                                });
+                                ui.end_row();
+
+                                ui.label("Reset");
+                                ui.label(quota.reset_date.as_deref().unwrap_or("-"));
+                                ui.end_row();
+                            });
+                    } else {
+                        ui.label("Loading quota...");
+                    }
+                }
             });
 
             if let Some(error) = &self.state.error {
@@ -321,13 +309,6 @@ impl eframe::App for RouterApp {
             }
 
             ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.label("Profiles");
-                if ui.button("Refresh Profiles").clicked() {
-                    let _ = self.cmd_tx.send(AppCommand::LoadProfiles);
-                }
-            });
 
             ui.horizontal(|ui| {
                 ui.label("Save as");
@@ -344,26 +325,6 @@ impl eframe::App for RouterApp {
 
             if let Some(message) = &self.state.profile_message {
                 ui.label(message);
-            }
-
-            if self.state.profiles.is_empty() {
-                ui.label("No profiles yet. Save current login or run codex login.");
-            }
-
-            for profile in switchable_profiles(&self.state.profiles) {
-                ui.horizontal(|ui| {
-                    ui.label(&profile.name);
-                    if let Some(email) = &profile.email {
-                        ui.label(email);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Switch").clicked() {
-                            let _ = self
-                                .cmd_tx
-                                .send(AppCommand::SwitchProfile(profile.name.clone()));
-                        }
-                    });
-                });
             }
 
             ui.separator();
@@ -430,6 +391,14 @@ mod tests {
     use crate::refresh::RefreshSchedule;
     use std::time::{Duration, Instant};
 
+    fn switchable_profiles(profiles: &[crate::profile::ProfileSummary]) -> Vec<crate::profile::ProfileSummary> {
+        profiles
+            .iter()
+            .filter(|profile| !profile.is_current)
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn router_app_initializes_state() {
         let app = RouterApp::new();
@@ -471,11 +440,13 @@ mod tests {
                 name: "work".to_string(),
                 email: Some("work@example.com".to_string()),
                 is_current: true,
+                quota: None,
             },
             ProfileSummary {
                 name: "personal".to_string(),
                 email: Some("personal@example.com".to_string()),
                 is_current: false,
+                quota: None,
             },
         ];
 

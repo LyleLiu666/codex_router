@@ -17,7 +17,7 @@ const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_USER_AGENT: &str = "codex-cli";
 
 /// Quota information
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct QuotaInfo {
     pub account_id: String,
     pub email: String,

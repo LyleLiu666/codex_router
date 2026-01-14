@@ -267,11 +267,13 @@ mod tests {
                 name: "beta".to_string(),
                 email: None,
                 is_current: false,
+                quota: None,
             },
             ProfileSummary {
                 name: "alpha".to_string(),
                 email: Some("alpha@example.com".to_string()),
                 is_current: true,
+                quota: None,
             },
         ];
 

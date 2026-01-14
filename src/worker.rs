@@ -9,6 +9,22 @@ use crate::config;
 use crate::login_output;
 use crate::{api, auth, profile};
 
+fn load_profiles_with_quota(
+    runtime: &tokio::runtime::Runtime,
+) -> anyhow::Result<Vec<profile::ProfileSummary>> {
+    let mut profiles = profile::list_profiles_data()?;
+    for profile_summary in &mut profiles {
+        let auth = match profile::load_profile_auth(&profile_summary.name) {
+            Ok(auth) => auth,
+            Err(_) => continue,
+        };
+        if let Ok(quota) = runtime.block_on(api::fetch_quota(&auth)) {
+            profile_summary.quota = Some(quota);
+        }
+    }
+    Ok(profiles)
+}
+
 fn read_existing_auth_json(path: &Path) -> Option<String> {
     if !path.exists() {
         return None;
@@ -109,16 +125,14 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                     }
                 }
                 AppCommand::FetchQuota => {
-                    let result = auth::load_auth()
-                        .and_then(|auth| runtime.block_on(api::fetch_quota(&auth)));
-                    match result {
-                        Ok(quota) => {
-                            let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
+                    match load_profiles_with_quota(&runtime) {
+                        Ok(profiles) => {
+                            let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                         }
                         Err(err) => {
                             let _ = evt_tx.send(AppEvent::Error(err.to_string()));
                         }
-                    }
+                    };
                 }
                 AppCommand::RunLogin => {
                     let previous_auth_json = config::get_auth_file()
@@ -215,19 +229,22 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                 return;
                             }
 
-                            if let Ok(profiles) = profile::list_profiles_data() {
-                                let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                            let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
+                            match load_profiles_with_quota(&runtime) {
+                                Ok(profiles) => {
+                                    let current_quota = profiles
+                                        .iter()
+                                        .find(|profile| profile.is_current)
+                                        .and_then(|profile| profile.quota.clone());
+                                    let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                                    if let Some(quota) = current_quota {
+                                        let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                                }
                             }
-
-                            let _ = auth::load_auth()
-                                .and_then(|auth| {
-                                    let runtime = tokio::runtime::Runtime::new()
-                                        .expect("failed to create runtime");
-                                    runtime.block_on(api::fetch_quota(&auth))
-                                })
-                                .map(|quota| {
-                                    let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
-                                });
                         }
                     });
                 }
@@ -243,9 +260,36 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
     use std::time::Duration;
     use crate::test_support::{EnvGuard, ENV_LOCK};
+
+    struct StringEnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl StringEnvGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let original = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for StringEnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                env::set_var(self.key, value);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn worker_emits_profiles_loaded() {
@@ -341,5 +385,146 @@ mod tests {
         assert_eq!(restored_value, expected_value);
         assert_eq!(fs::read_to_string(temp_dir.path().join(".current_profile")).unwrap(), "work");
         assert!(profiles_dir.join("new").exists());
+    }
+
+    #[test]
+    fn run_login_populates_profile_quotas() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _base_url_guard =
+            StringEnvGuard::set("CODEX_ROUTER_CHATGPT_BASE_URL", format!("http://{addr}"));
+        let server = thread::spawn(move || {
+            let expected_requests = 2;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut handled = 0;
+
+            while handled < expected_requests && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(err) => panic!("failed to accept quota request: {err}"),
+                };
+
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"reset_at":"2025-01-01T00:00:00Z"},"secondary_window":{"used_percent":20}}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                handled += 1;
+            }
+
+            handled
+        });
+
+        let old_jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im9sZEBleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyIsImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3Rfb2xkIn19.sig";
+        let old_auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: Some(auth::IdToken::Raw(old_jwt.to_string())),
+                access_token: "old-access".to_string(),
+                refresh_token: "old-refresh".to_string(),
+                account_id: Some("acct_old".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let new_jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im5ld0BleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InRlYW0iLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0X25ldyJ9fQ.sig";
+        let new_auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: Some(auth::IdToken::Raw(new_jwt.to_string())),
+                access_token: "new-access".to_string(),
+                refresh_token: "new-refresh".to_string(),
+                account_id: Some("acct_new".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("work")).unwrap();
+        fs::write(
+            profiles_dir.join("work").join("auth.json"),
+            serde_json::to_string_pretty(&old_auth).unwrap(),
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join(".current_profile"), "work").unwrap();
+
+        let auth_path = temp_dir.path().join("auth.json");
+        fs::write(&auth_path, serde_json::to_string_pretty(&old_auth).unwrap()).unwrap();
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let codex_path = bin_dir.join("codex");
+        fs::write(
+            &codex_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then\n  cat > \"$CODEX_HOME/auth.json\" <<'EOF'\n{}\nEOF\n  echo \"ok\"\n  exit 0\nfi\nexit 1\n",
+                serde_json::to_string_pretty(&new_auth).unwrap()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&codex_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&codex_path, perms).unwrap();
+        }
+
+        let original_path = env::var("PATH").ok();
+        let _path_guard = StringEnvGuard::set(
+            "PATH",
+            match original_path {
+                Some(existing) if existing.is_empty() => bin_dir.to_string_lossy().to_string(),
+                Some(existing) => format!("{}:{}", bin_dir.to_string_lossy(), existing),
+                None => bin_dir.to_string_lossy().to_string(),
+            },
+        );
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let handle = start_worker(cmd_rx, evt_tx);
+
+        cmd_tx.send(AppCommand::RunLogin).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut profiles_with_quota = None;
+        while std::time::Instant::now() < deadline {
+            let Ok(event) = evt_rx.recv_timeout(Duration::from_millis(200)) else {
+                continue;
+            };
+            let AppEvent::ProfilesLoaded(profiles) = event else {
+                continue;
+            };
+            if profiles.iter().any(|profile| profile.name == "new")
+                && profiles.iter().all(|profile| profile.quota.is_some())
+            {
+                profiles_with_quota = Some(profiles);
+                break;
+            }
+        }
+
+        let profiles = profiles_with_quota.expect("expected profiles loaded with quota after login");
+        assert!(profiles.iter().all(|profile| profile.quota.is_some()));
+
+        cmd_tx.send(AppCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            2,
+            "expected the quota server to receive both profile requests"
+        );
     }
 }

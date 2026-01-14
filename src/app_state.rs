@@ -142,6 +142,7 @@ mod tests {
             name: "work".to_string(),
             email: None,
             is_current: true,
+            quota: None,
         }
     }
 

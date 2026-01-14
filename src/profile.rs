@@ -9,6 +9,7 @@ pub struct ProfileSummary {
     pub name: String,
     pub email: Option<String>,
     pub is_current: bool,
+    pub quota: Option<crate::api::QuotaInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +48,26 @@ pub fn list_profiles_data() -> Result<Vec<ProfileSummary>> {
             name,
             email,
             is_current,
+            quota: None,
         });
     }
 
     profiles.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(profiles)
+}
+
+/// Load auth data for a specific profile
+pub fn load_profile_auth(profile_name: &str) -> Result<AuthDotJson> {
+    let profiles_dir = get_profiles_dir()?;
+    let profile_auth_file = profiles_dir.join(profile_name).join("auth.json");
+    
+    if !profile_auth_file.exists() {
+        anyhow::bail!("Profile '{}' not found.", profile_name);
+    }
+    
+    let auth_json = fs::read_to_string(&profile_auth_file)?;
+    let auth: AuthDotJson = serde_json::from_str(&auth_json)?;
+    Ok(auth)
 }
 
 fn token_fingerprint(auth: &AuthDotJson) -> Option<String> {
