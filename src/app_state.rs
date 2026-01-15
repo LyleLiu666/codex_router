@@ -12,6 +12,7 @@ pub enum AppCommand {
     #[allow(dead_code)]
     DeleteProfile(String),
     RunLogin,
+    CancelLogin,
     OpenLoginUrl(String),
     FetchQuota,
     FetchProfileQuota(String),

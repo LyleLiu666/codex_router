@@ -1,13 +1,240 @@
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::{fs, path::Path};
+
+/// Shared holder for the login child process, allowing cancellation from the main thread.
+type LoginProcessHolder = Arc<Mutex<Option<u32>>>;
 
 use crate::app_state::{AppCommand, AppEvent};
 use crate::config;
 use crate::login_output;
 use crate::{api, auth, profile};
+
+/// Find the codex binary using multiple detection strategies.
+/// Priority order:
+/// 1. Manual PATH search (more reliable than `which` in GUI apps)
+/// 2. Node version managers: nvm, volta, fnm, asdf
+/// 3. npm global prefix detection
+/// 4. Common system locations
+fn find_codex_binary() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let home_path = Path::new(&home);
+
+    // Strategy 1: Search PATH manually (works better in GUI apps than `which`)
+    if let Some(path) = search_in_path("codex") {
+        tracing::debug!("Found codex in PATH: {:?}", path);
+        return Some(path);
+    }
+
+    // Strategy 2: Check node version managers
+    
+    // nvm - check current version first, then all versions
+    if let Some(path) = find_in_nvm(home_path) {
+        tracing::debug!("Found codex via nvm: {:?}", path);
+        return Some(path);
+    }
+
+    // volta
+    let volta_bin = home_path.join(".volta/bin/codex");
+    if volta_bin.exists() {
+        tracing::debug!("Found codex via volta: {:?}", volta_bin);
+        return Some(volta_bin);
+    }
+
+    // fnm (Fast Node Manager)
+    if let Some(path) = find_in_fnm(home_path) {
+        tracing::debug!("Found codex via fnm: {:?}", path);
+        return Some(path);
+    }
+
+    // asdf
+    if let Some(path) = find_in_asdf(home_path) {
+        tracing::debug!("Found codex via asdf: {:?}", path);
+        return Some(path);
+    }
+
+    // Strategy 3: Query npm for global prefix
+    if let Some(path) = find_via_npm_prefix() {
+        tracing::debug!("Found codex via npm prefix: {:?}", path);
+        return Some(path);
+    }
+
+    // Strategy 4: Check common system locations
+    let system_locations = [
+        PathBuf::from("/opt/homebrew/bin/codex"),  // Homebrew Apple Silicon
+        PathBuf::from("/usr/local/bin/codex"),     // Homebrew Intel / manual install
+        home_path.join(".local/bin/codex"),        // XDG local bin
+        home_path.join(".npm-global/bin/codex"),   // Common npm global config
+        home_path.join("bin/codex"),               // User bin
+    ];
+
+    for location in &system_locations {
+        if location.exists() {
+            tracing::debug!("Found codex at system location: {:?}", location);
+            return Some(location.clone());
+        }
+    }
+
+    tracing::warn!("codex binary not found in any known location");
+    None
+}
+
+/// Search for a binary in PATH environment variable
+fn search_in_path(binary_name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in path_var.split(':') {
+        let candidate = Path::new(dir).join(binary_name);
+        if candidate.exists() && candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Find codex in nvm installations
+fn find_in_nvm(home: &Path) -> Option<PathBuf> {
+    let nvm_dir = home.join(".nvm/versions/node");
+    if !nvm_dir.exists() {
+        return None;
+    }
+
+    // Try to get current nvm version from NVM_BIN or .nvmrc
+    if let Ok(nvm_bin) = std::env::var("NVM_BIN") {
+        let codex_path = Path::new(&nvm_bin).join("codex");
+        if codex_path.exists() {
+            return Some(codex_path);
+        }
+    }
+
+    // Fallback: search all installed node versions, prefer newer versions
+    let mut versions: Vec<_> = fs::read_dir(&nvm_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    
+    // Sort by version number descending (newer first)
+    versions.sort_by(|a, b| {
+        let va = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let vb = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        version_cmp(vb, va)
+    });
+
+    for version_dir in versions {
+        let codex_path = version_dir.join("bin/codex");
+        if codex_path.exists() {
+            return Some(codex_path);
+        }
+    }
+    None
+}
+
+/// Find codex in fnm installations
+fn find_in_fnm(home: &Path) -> Option<PathBuf> {
+    // fnm stores versions in different locations based on config
+    let fnm_dirs = [
+        home.join(".fnm/node-versions"),
+        home.join("Library/Application Support/fnm/node-versions"),
+    ];
+
+    for fnm_dir in &fnm_dirs {
+        if !fnm_dir.exists() {
+            continue;
+        }
+
+        let mut versions: Vec<_> = fs::read_dir(fnm_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+
+        versions.sort_by(|a, b| {
+            let va = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let vb = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            version_cmp(vb, va)
+        });
+
+        for version_dir in versions {
+            let codex_path = version_dir.join("installation/bin/codex");
+            if codex_path.exists() {
+                return Some(codex_path);
+            }
+        }
+    }
+    None
+}
+
+/// Find codex in asdf installations
+fn find_in_asdf(home: &Path) -> Option<PathBuf> {
+    let asdf_dir = home.join(".asdf/installs/nodejs");
+    if !asdf_dir.exists() {
+        return None;
+    }
+
+    let mut versions: Vec<_> = fs::read_dir(&asdf_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+
+    versions.sort_by(|a, b| {
+        let va = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let vb = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        version_cmp(vb, va)
+    });
+
+    for version_dir in versions {
+        let codex_path = version_dir.join("bin/codex");
+        if codex_path.exists() {
+            return Some(codex_path);
+        }
+    }
+    None
+}
+
+/// Find codex by querying npm for its global prefix
+fn find_via_npm_prefix() -> Option<PathBuf> {
+    // Try to find npm first
+    let npm_path = search_in_path("npm")?;
+    
+    let output = Command::new(&npm_path)
+        .args(["config", "get", "prefix"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let codex_path = Path::new(&prefix).join("bin/codex");
+    if codex_path.exists() {
+        return Some(codex_path);
+    }
+    None
+}
+
+/// Compare version strings (e.g., "v20.10.0" vs "v18.19.1")
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse_version = |s: &str| -> Vec<u32> {
+        s.trim_start_matches('v')
+            .split('.')
+            .filter_map(|part| part.parse().ok())
+            .collect()
+    };
+    
+    let va = parse_version(a);
+    let vb = parse_version(b);
+    va.cmp(&vb)
+}
 
 fn load_profiles_with_quota(
     runtime: &tokio::runtime::Runtime,
@@ -73,6 +300,7 @@ fn finalize_login(previous_auth_json: Option<String>) -> anyhow::Result<()> {
 pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
+        let login_process: LoginProcessHolder = Arc::new(Mutex::new(None));
 
         while let Ok(command) = cmd_rx.recv() {
             match command {
@@ -157,6 +385,7 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                         .and_then(|path| read_existing_auth_json(&path));
 
                     let evt_tx = evt_tx.clone();
+                    let login_process = Arc::clone(&login_process);
                     std::thread::spawn(move || {
                         let _ = evt_tx.send(AppEvent::LoginOutput {
                             output: String::new(),
@@ -164,7 +393,18 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                             running: true,
                         });
 
-                        let mut child = match Command::new("codex")
+                        let codex_path = match find_codex_binary() {
+                            Some(path) => path,
+                            None => {
+                                let _ = evt_tx.send(AppEvent::LoginFinished {
+                                    success: false,
+                                    message: "codex binary not found. Please install it via: npm install -g @openai/codex".to_string(),
+                                });
+                                return;
+                            }
+                        };
+
+                        let mut child = match Command::new(&codex_path)
                             .arg("login")
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
@@ -179,6 +419,12 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                 return;
                             }
                         };
+
+                        // Store the child process ID for cancellation
+                        {
+                            let mut holder = login_process.lock().unwrap();
+                            *holder = Some(child.id());
+                        }
 
                         let stdout = child.stdout.take();
                         let stderr = child.stderr.take();
@@ -235,6 +481,12 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                             Err(err) => (false, format!("codex login failed: {err}")),
                         };
 
+                        // Clear the process holder
+                        {
+                            let mut holder = login_process.lock().unwrap();
+                            *holder = None;
+                        }
+
                         let _ = evt_tx.send(AppEvent::LoginFinished {
                             success,
                             message: message.clone(),
@@ -264,6 +516,31 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                             }
                         }
                     });
+                }
+                AppCommand::CancelLogin => {
+                    let pid = {
+                        let mut holder = login_process.lock().unwrap();
+                        holder.take()
+                    };
+                    if let Some(pid) = pid {
+                        // Send SIGTERM to gracefully terminate the login process
+                        #[cfg(unix)]
+                        {
+                            let _ = Command::new("kill")
+                                .args(["-TERM", &pid.to_string()])
+                                .status();
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = Command::new("taskkill")
+                                .args(["/PID", &pid.to_string(), "/F"])
+                                .status();
+                        }
+                        let _ = evt_tx.send(AppEvent::LoginFinished {
+                            success: false,
+                            message: "Login cancelled".to_string(),
+                        });
+                    }
                 }
                 AppCommand::OpenLoginUrl(url) => {
                     let _ = Command::new("open").arg(url).status();

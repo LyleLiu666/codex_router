@@ -365,6 +365,9 @@ impl eframe::App for RouterApp {
                 }
                 if self.state.login_running {
                     ui.label("Running…");
+                    if ui.button("Cancel").clicked() {
+                        let _ = self.cmd_tx.send(AppCommand::CancelLogin);
+                    }
                 }
             });
 
