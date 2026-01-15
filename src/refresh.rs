@@ -14,6 +14,7 @@ impl RefreshSchedule {
         self.next_due = None;
     }
 
+    #[allow(dead_code)]
     pub fn next_due(&self) -> Option<Instant> {
         self.next_due
     }

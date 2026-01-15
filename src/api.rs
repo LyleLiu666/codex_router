@@ -85,6 +85,7 @@ struct CodexCreditStatus {
 }
 
 /// Check quota for the current profile
+#[allow(dead_code)]
 pub async fn check_quota() -> Result<QuotaInfo> {
     let auth = auth::load_auth()?;
     fetch_quota(&auth).await
@@ -123,6 +124,7 @@ pub async fn fetch_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
 }
 
 /// Watch quota with auto-refresh (deprecated in UI mode)
+#[allow(dead_code)]
 pub async fn watch_quota() -> Result<()> {
     anyhow::bail!("watch_quota is only available in the desktop UI")
 }
@@ -276,9 +278,7 @@ fn format_plan_type_with_credits(plan_type: String, credits: Option<&CodexCredit
     format!("{plan_type} (credits: {balance})")
 }
 
-fn chatgpt_base_url() -> String {
-    env::var("CODEX_ROUTER_CHATGPT_BASE_URL").unwrap_or_else(|_| DEFAULT_CHATGPT_BASE_URL.to_string())
-}
+
 
 fn codex_usage_urls() -> Vec<String> {
     let configured = env::var("CODEX_ROUTER_CHATGPT_BASE_URL")

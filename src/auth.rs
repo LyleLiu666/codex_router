@@ -85,6 +85,7 @@ pub fn load_auth() -> Result<AuthDotJson> {
 }
 
 /// Save auth to the active auth.json file
+#[allow(dead_code)]
 pub fn save_auth(auth: &AuthDotJson) -> Result<()> {
     let auth_file = get_auth_file()?;
 
@@ -109,6 +110,7 @@ pub fn save_auth(auth: &AuthDotJson) -> Result<()> {
 }
 
 /// Load auth from a profile directory
+#[allow(dead_code)]
 pub fn load_auth_from_profile(profile_name: &str) -> Result<AuthDotJson> {
     let codex_home = get_codex_home()?;
     let profile_auth_file = codex_home
@@ -190,6 +192,7 @@ pub fn get_plan_type(auth: &AuthDotJson) -> Option<String> {
 }
 
 /// Format auth info for display
+#[allow(dead_code)]
 pub fn format_auth_info(auth: &AuthDotJson) -> String {
     let email = get_email(auth).unwrap_or_else(|| "N/A".to_string());
     let account_id = get_account_id(auth).unwrap_or_else(|| "N/A".to_string());

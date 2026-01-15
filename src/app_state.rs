@@ -9,6 +9,7 @@ pub enum AppCommand {
     LoadProfiles,
     SwitchProfile(String),
     SaveProfile(String),
+    #[allow(dead_code)]
     DeleteProfile(String),
     RunLogin,
     OpenLoginUrl(String),

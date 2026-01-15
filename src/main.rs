@@ -9,12 +9,25 @@ mod worker;
 mod app;
 mod tray;
 mod login_output;
+mod icon;
 #[cfg(test)]
 mod test_support;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
-    let options = eframe::NativeOptions::default();
+    
+    let (rgba, width, height) = icon::generate_icon_rgba();
+    let icon_data = eframe::egui::IconData {
+        rgba,
+        width,
+        height,
+    };
+    
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_icon(icon_data),
+        ..Default::default()
+    };
+    
     eframe::run_native(
         "Codex Router",
         options,
