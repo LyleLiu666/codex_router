@@ -34,7 +34,7 @@ impl TrayHandle {
 }
 
 fn default_icon() -> Icon {
-    crate::icon::load_icon()
+    crate::icon::load_tray_icon()
 }
 
 fn menu_id_for_profile(name: &str) -> String {

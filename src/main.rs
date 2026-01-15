@@ -16,7 +16,7 @@ mod test_support;
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
     
-    let (rgba, width, height) = icon::generate_icon_rgba();
+    let (rgba, width, height) = icon::load_icon_data();
     let icon_data = eframe::egui::IconData {
         rgba,
         width,
