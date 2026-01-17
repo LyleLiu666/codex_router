@@ -72,6 +72,7 @@ else
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleExecutable</key><string>$BINARY_NAME</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
@@ -80,6 +81,37 @@ else
 </dict>
 </plist>
 EOF
+fi
+
+# Generate AppIcon.icns
+RESOURCES_DIR="$APP_CONTENTS/Resources"
+run_cmd mkdir -p "$RESOURCES_DIR"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "DRY RUN: Generate AppIcon.icns from assets/icon.png"
+else
+  ICON_SOURCE="$ROOT_DIR/assets/icon.png"
+  if [[ -f "$ICON_SOURCE" ]]; then
+    ICONSET_DIR="$BUILD_DIR/AppIcon.iconset"
+    mkdir -p "$ICONSET_DIR"
+    
+    # Generate various sizes
+    sips -z 16 16     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16.png" > /dev/null
+    sips -z 32 32     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16@2x.png" > /dev/null
+    sips -z 32 32     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32.png" > /dev/null
+    sips -z 64 64     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32@2x.png" > /dev/null
+    sips -z 128 128   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128.png" > /dev/null
+    sips -z 256 256   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128@2x.png" > /dev/null
+    sips -z 256 256   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256.png" > /dev/null
+    sips -z 512 512   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256@2x.png" > /dev/null
+    sips -z 512 512   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512.png" > /dev/null
+    sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512@2x.png" > /dev/null
+    
+    iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns"
+    rm -rf "$ICONSET_DIR"
+  else
+    echo "Warning: assets/icon.png not found, skipping icon generation"
+  fi
 fi
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then

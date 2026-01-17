@@ -404,11 +404,21 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                             }
                         };
 
-                        let mut child = match Command::new(&codex_path)
-                            .arg("login")
+                        let mut command = Command::new(&codex_path);
+                        command.arg("login")
                             .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
+                            .stderr(Stdio::piped());
+
+                        // Add the directory containing the codex binary to PATH
+                        // This ensures that `#!/usr/bin/env node` finds the node executable (which is often in the same dir)
+                        if let Some(parent) = codex_path.parent() {
+                            if let Ok(path) = std::env::var("PATH") {
+                                let new_path = format!("{}:{}", parent.display(), path);
+                                command.env("PATH", new_path);
+                            }
+                        }
+
+                        let mut child = match command.spawn()
                         {
                             Ok(child) => child,
                             Err(err) => {
