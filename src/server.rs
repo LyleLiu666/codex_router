@@ -72,7 +72,7 @@ async fn handle_chat_completions(
     let client = reqwest::Client::new();
     
     // Reconstruct body
-    let mut body_json = serde_json::to_value(&payload).unwrap();
+    let body_json = serde_json::to_value(&payload).unwrap();
     // Flatten extra fields back if needed, but serde already handled it in struct via flattened `extra`.
     // Actually, `serde_json::to_value` on `ChatRequest` will produce the correct structure including flattened extra.
     
