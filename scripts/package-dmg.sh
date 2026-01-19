@@ -9,7 +9,12 @@ BINARY_NAME="${BINARY_NAME:-codex_router}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/dist}"
 BUILD_DIR="${BUILD_DIR:-$OUT_DIR/build}"
 
-VERSION="$(awk -F '"' '/^version\s*=/{print $2; exit}' "$ROOT_DIR/Cargo.toml")"
+VERSION="$(grep "^version =" "$ROOT_DIR/Cargo.toml" | head -n1 | cut -d '"' -f 2)"
+
+if [[ -z "$VERSION" ]]; then
+  echo "Error: Could not extract version from Cargo.toml" >&2
+  exit 1
+fi
 DMG_NAME="${DMG_NAME:-Codex-Router-$VERSION}"
 DMG_PATH="$OUT_DIR/$DMG_NAME.dmg"
 
@@ -116,24 +121,46 @@ fi
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   run_cmd codesign --force --options runtime --timestamp --deep --sign "$CODESIGN_IDENTITY" "$APP_DIR"
-fi
-
-DMG_STAGE="$BUILD_DIR/dmg-stage"
-run_cmd mkdir -p "$DMG_STAGE"
-
-if [[ "$DRY_RUN" == "1" ]]; then
-  echo "DRY RUN: cp -R \"$APP_DIR\" \"$DMG_STAGE/\""
 else
-  cp -R "$APP_DIR" "$DMG_STAGE/"
+  # Ad-hoc sign for local use (required on Apple Silicon)
+  echo "No identity provided, performing ad-hoc signing..."
+  run_cmd codesign --force --deep --sign - "$APP_DIR"
 fi
 
-if [[ "$DRY_RUN" == "1" ]]; then
-  echo "DRY RUN: ln -s /Applications \"$DMG_STAGE/Applications\""
+# Create DMG with drag-and-drop interface
+if command -v create-dmg &>/dev/null; then
+  # Remove old DMG if exists (create-dmg doesn't have -ov flag)
+  rm -f "$DMG_PATH"
+  
+  run_cmd create-dmg \
+    --volname "$APP_NAME" \
+    --window-pos 200 120 \
+    --window-size 600 400 \
+    --icon-size 100 \
+    --icon "$APP_NAME.app" 150 190 \
+    --app-drop-link 450 190 \
+    --no-internet-enable \
+    "$DMG_PATH" \
+    "$APP_DIR"
 else
-  ln -s /Applications "$DMG_STAGE/Applications"
+  echo "Warning: create-dmg not found, using basic hdiutil (no visual interface)"
+  DMG_STAGE="$BUILD_DIR/dmg-stage"
+  run_cmd mkdir -p "$DMG_STAGE"
+  
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "DRY RUN: cp -R \"$APP_DIR\" \"$DMG_STAGE/\""
+  else
+    cp -R "$APP_DIR" "$DMG_STAGE/"
+  fi
+  
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "DRY RUN: ln -s /Applications \"$DMG_STAGE/Applications\""
+  else
+    ln -s /Applications "$DMG_STAGE/Applications"
+  fi
+  
+  run_cmd hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH"
 fi
-
-run_cmd hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGE" -format UDZO -ov "$DMG_PATH"
 
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
   run_cmd xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
