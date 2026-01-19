@@ -10,6 +10,9 @@ use crate::refresh::RefreshSchedule;
 use crate::state::{self, RouterState};
 use crate::tray::{self, TrayEvent, TrayHandle};
 use crate::worker;
+use crate::shared::SharedState;
+use std::sync::Arc;
+
 
 pub struct RouterApp {
     state: AppState,
@@ -21,6 +24,7 @@ pub struct RouterApp {
     tray_rx: Receiver<TrayEvent>,
     tray_handle: Option<TrayHandle>,
     worker_handle: Option<JoinHandle<()>>,
+    shared_state: Arc<SharedState>,
 }
 
 impl RouterApp {
@@ -34,6 +38,14 @@ impl RouterApp {
         } else {
             Some(tray::start_tray(tray_tx))
         };
+
+        let shared_state = Arc::new(SharedState::new());
+        let server_state = shared_state.clone();
+        
+        // Start API server
+        tokio::spawn(async move {
+            crate::server::start_server(server_state).await;
+        });
 
         let mut state = AppState::default();
         let router_state = match state::load_state() {
@@ -58,6 +70,7 @@ impl RouterApp {
             tray_rx,
             tray_handle,
             worker_handle: Some(worker_handle),
+            shared_state,
         }
     }
 
@@ -172,7 +185,11 @@ impl eframe::App for RouterApp {
                     tray_handle.update_profiles(profiles);
                 }
             }
+            let event_for_shared = event.clone();
             self.state.apply_event(event);
+            if matches!(event_for_shared, AppEvent::ProfilesLoaded(_) | AppEvent::QuotaLoaded(_) | AppEvent::ProfileQuotaLoaded { .. }) {
+                 self.shared_state.update_profiles(self.state.profiles.clone());
+            }
             if is_profiles_loaded {
                 let next_profile = self.state.current_profile.clone();
                 if should_fetch_on_profile_change(
@@ -204,6 +221,7 @@ impl eframe::App for RouterApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Codex Router");
 
             ui.group(|ui| {
@@ -387,7 +405,8 @@ impl eframe::App for RouterApp {
                     ui.monospace(&self.state.login_output);
                 });
             }
-        });
+            }); // ScrollArea
+        }); // CentralPanel
 
         let interval = Duration::from_secs(self.state.refresh_interval_seconds.max(60));
         if auto_refresh_tick(
