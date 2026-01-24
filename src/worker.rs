@@ -328,7 +328,8 @@ fn read_existing_auth_json(path: &Path) -> Option<String> {
 }
 
 fn finalize_login(previous_auth_json: Option<String>) -> anyhow::Result<()> {
-    let new_auth = auth::load_auth()?;
+    // Read newly logged-in auth from official codex directory
+    let new_auth = auth::load_auth_from_official_codex()?;
     let outcome = profile::save_auth_as_profile_without_switch(&new_auth)?;
 
     let name = match &outcome {
@@ -337,30 +338,32 @@ fn finalize_login(previous_auth_json: Option<String>) -> anyhow::Result<()> {
         | profile::SaveProfileOutcome::AlreadyExists { name } => name.clone(),
     };
 
+    // Restore previous auth.json in official codex directory (if any)
+    // This prevents our login from affecting the official codex CLI's current session
+    let official_auth_file = config::get_official_auth_file()?;
+    if let Some(previous) = previous_auth_json {
+        fs::write(&official_auth_file, previous)?;
+    }
+
+    // Set current profile in our isolated config if not already set
+    let current_profile_file = config::get_current_profile_file()?;
+    let needs_current_profile = match fs::read_to_string(&current_profile_file) {
+        Ok(contents) => contents.trim().is_empty(),
+        Err(_) => true,
+    };
+    if needs_current_profile {
+        if let Some(parent) = current_profile_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&current_profile_file, &name)?;
+    }
+
+    // Save auth to our isolated config directory
     let auth_file = config::get_auth_file()?;
     if let Some(parent) = auth_file.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    match previous_auth_json {
-        Some(previous) => {
-            fs::write(auth_file, previous)?;
-        }
-        None => {
-            let current_profile_file = config::get_current_profile_file()?;
-            let needs_current_profile = match fs::read_to_string(&current_profile_file) {
-                Ok(contents) => contents.trim().is_empty(),
-                Err(_) => true,
-            };
-            if needs_current_profile {
-                if let Some(parent) = current_profile_file.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&current_profile_file, &name)?;
-            }
-            fs::write(auth_file, serde_json::to_string_pretty(&new_auth)?)?;
-        }
-    }
+    fs::write(auth_file, serde_json::to_string_pretty(&new_auth)?)?;
 
     Ok(())
 }
@@ -444,7 +447,8 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                     }
                 },
                 AppCommand::RunLogin => {
-                    let previous_auth_json = config::get_auth_file()
+                    // Read previous auth from official codex directory (to restore after login)
+                    let previous_auth_json = config::get_official_auth_file()
                         .ok()
                         .and_then(|path| read_existing_auth_json(&path));
 

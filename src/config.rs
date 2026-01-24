@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::env;
+use std::path::PathBuf;
 
-/// Get the Codex home directory
+/// Get the codex_router home directory (isolated from official codex)
 pub fn get_codex_home() -> Result<PathBuf> {
     if let Ok(val) = env::var("CODEX_HOME") {
         if !val.is_empty() {
@@ -14,7 +14,22 @@ pub fn get_codex_home() -> Result<PathBuf> {
         .or_else(|_| env::var("USERPROFILE"))
         .context("Cannot determine home directory")?;
 
+    Ok(PathBuf::from(home).join(".codex_router"))
+}
+
+/// Get the official Codex CLI home directory (for migration)
+pub fn get_official_codex_home() -> Result<PathBuf> {
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .context("Cannot determine home directory")?;
+
     Ok(PathBuf::from(home).join(".codex"))
+}
+
+/// Get the official Codex CLI auth file (for migration)
+pub fn get_official_auth_file() -> Result<PathBuf> {
+    let codex_home = get_official_codex_home()?;
+    Ok(codex_home.join("auth.json"))
 }
 
 /// Get the profiles directory

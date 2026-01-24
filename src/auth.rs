@@ -78,8 +78,25 @@ pub fn load_auth() -> Result<AuthDotJson> {
     let content = fs::read_to_string(&auth_file)
         .with_context(|| format!("Failed to read auth file: {:?}", auth_file))?;
 
-    let auth: AuthDotJson = serde_json::from_str(&content)
-        .with_context(|| "Failed to parse auth.json")?;
+    let auth: AuthDotJson =
+        serde_json::from_str(&content).with_context(|| "Failed to parse auth.json")?;
+
+    Ok(auth)
+}
+
+/// Load auth from the official Codex CLI auth.json file (for migration)
+pub fn load_auth_from_official_codex() -> Result<AuthDotJson> {
+    let auth_file = crate::config::get_official_auth_file()?;
+
+    if !auth_file.exists() {
+        anyhow::bail!("Official codex auth not found. Please run 'codex login' first.");
+    }
+
+    let content = fs::read_to_string(&auth_file)
+        .with_context(|| format!("Failed to read official auth file: {:?}", auth_file))?;
+
+    let auth: AuthDotJson =
+        serde_json::from_str(&content).with_context(|| "Failed to parse official auth.json")?;
 
     Ok(auth)
 }
@@ -125,8 +142,8 @@ pub fn load_auth_from_profile(profile_name: &str) -> Result<AuthDotJson> {
     let content = fs::read_to_string(&profile_auth_file)
         .with_context(|| format!("Failed to read profile auth file: {:?}", profile_auth_file))?;
 
-    let auth: AuthDotJson = serde_json::from_str(&content)
-        .with_context(|| "Failed to parse profile auth.json")?;
+    let auth: AuthDotJson =
+        serde_json::from_str(&content).with_context(|| "Failed to parse profile auth.json")?;
 
     Ok(auth)
 }
@@ -198,7 +215,10 @@ pub fn format_auth_info(auth: &AuthDotJson) -> String {
     let account_id = get_account_id(auth).unwrap_or_else(|| "N/A".to_string());
     let plan = get_plan_type(auth).unwrap_or_else(|| "N/A".to_string());
 
-    format!("Email: {}\nAccount ID: {}\nPlan: {}", email, account_id, plan)
+    format!(
+        "Email: {}\nAccount ID: {}\nPlan: {}",
+        email, account_id, plan
+    )
 }
 
 #[cfg(test)]
