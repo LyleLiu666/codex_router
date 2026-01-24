@@ -31,7 +31,7 @@ fn find_codex_binary() -> Option<PathBuf> {
     }
 
     // Strategy 2: Check node version managers
-    
+
     // nvm - check current version first, then all versions
     if let Some(path) = find_in_nvm(home_path) {
         tracing::debug!("Found codex via nvm: {:?}", path);
@@ -65,11 +65,11 @@ fn find_codex_binary() -> Option<PathBuf> {
 
     // Strategy 4: Check common system locations
     let system_locations = [
-        PathBuf::from("/opt/homebrew/bin/codex"),  // Homebrew Apple Silicon
-        PathBuf::from("/usr/local/bin/codex"),     // Homebrew Intel / manual install
-        home_path.join(".local/bin/codex"),        // XDG local bin
-        home_path.join(".npm-global/bin/codex"),   // Common npm global config
-        home_path.join("bin/codex"),               // User bin
+        PathBuf::from("/opt/homebrew/bin/codex"), // Homebrew Apple Silicon
+        PathBuf::from("/usr/local/bin/codex"),    // Homebrew Intel / manual install
+        home_path.join(".local/bin/codex"),       // XDG local bin
+        home_path.join(".npm-global/bin/codex"),  // Common npm global config
+        home_path.join("bin/codex"),              // User bin
     ];
 
     for location in &system_locations {
@@ -116,7 +116,7 @@ fn find_in_nvm(home: &Path) -> Option<PathBuf> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .collect();
-    
+
     // Sort by version number descending (newer first)
     versions.sort_by(|a, b| {
         let va = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -200,7 +200,7 @@ fn find_in_asdf(home: &Path) -> Option<PathBuf> {
 fn find_via_npm_prefix() -> Option<PathBuf> {
     // Try to find npm first
     let npm_path = search_in_path("npm")?;
-    
+
     let output = Command::new(&npm_path)
         .args(["config", "get", "prefix"])
         .output()
@@ -230,7 +230,7 @@ fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             .filter_map(|part| part.parse().ok())
             .collect()
     };
-    
+
     let va = parse_version(a);
     let vb = parse_version(b);
     va.cmp(&vb)
@@ -245,8 +245,15 @@ fn load_profiles_with_quota(
             Ok(auth) => auth,
             Err(_) => continue,
         };
-        if let Ok(quota) = runtime.block_on(api::fetch_quota(&auth)) {
-            profile_summary.quota = Some(quota);
+        match runtime.block_on(api::fetch_quota(&auth)) {
+            Ok(quota) => {
+                profile_summary.quota = Some(quota);
+            }
+            Err(err) => {
+                if let Some(api::AuthError::Expired) = err.downcast_ref::<api::AuthError>() {
+                    profile_summary.is_valid = false;
+                }
+            }
         }
     }
     Ok(profiles)
@@ -304,16 +311,14 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
 
         while let Ok(command) = cmd_rx.recv() {
             match command {
-                AppCommand::LoadProfiles => {
-                    match profile::list_profiles_data() {
-                        Ok(profiles) => {
-                            let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
-                        }
-                        Err(err) => {
-                            let _ = evt_tx.send(AppEvent::Error(err.to_string()));
-                        }
+                AppCommand::LoadProfiles => match profile::list_profiles_data() {
+                    Ok(profiles) => {
+                        let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                     }
-                }
+                    Err(err) => {
+                        let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                    }
+                },
                 AppCommand::SwitchProfile(name) => {
                     let result = runtime.block_on(profile::switch_profile(&name));
                     match result {
@@ -327,31 +332,27 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                         }
                     }
                 }
-                AppCommand::SaveProfile(name) => {
-                    match profile::save_profile(&name) {
-                        Ok(outcome) => {
-                            let _ = evt_tx.send(AppEvent::ProfileSaved(outcome));
-                            if let Ok(profiles) = profile::list_profiles_data() {
-                                let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
-                            }
-                        }
-                        Err(err) => {
-                            let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                AppCommand::SaveProfile(name) => match profile::save_profile(&name) {
+                    Ok(outcome) => {
+                        let _ = evt_tx.send(AppEvent::ProfileSaved(outcome));
+                        if let Ok(profiles) = profile::list_profiles_data() {
+                            let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                         }
                     }
-                }
-                AppCommand::DeleteProfile(name) => {
-                    match profile::delete_profile(&name) {
-                        Ok(()) => {
-                            if let Ok(profiles) = profile::list_profiles_data() {
-                                let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
-                            }
-                        }
-                        Err(err) => {
-                            let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                    Err(err) => {
+                        let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                    }
+                },
+                AppCommand::DeleteProfile(name) => match profile::delete_profile(&name) {
+                    Ok(()) => {
+                        if let Ok(profiles) = profile::list_profiles_data() {
+                            let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                         }
                     }
-                }
+                    Err(err) => {
+                        let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                    }
+                },
                 AppCommand::FetchQuota => {
                     match load_profiles_with_quota(&runtime) {
                         Ok(profiles) => {
@@ -362,23 +363,25 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                         }
                     };
                 }
-                AppCommand::FetchProfileQuota(name) => {
-                    match profile::load_profile_auth(&name) {
-                        Ok(auth) => {
-                            match runtime.block_on(api::fetch_quota(&auth)) {
-                                Ok(quota) => {
-                                    let _ = evt_tx.send(AppEvent::ProfileQuotaLoaded { name, quota });
-                                }
-                                Err(err) => {
-                                    let _ = evt_tx.send(AppEvent::Error(format!("Failed to fetch quota for {}: {}", name, err)));
-                                }
-                            }
+                AppCommand::FetchProfileQuota(name) => match profile::load_profile_auth(&name) {
+                    Ok(auth) => match runtime.block_on(api::fetch_quota(&auth)) {
+                        Ok(quota) => {
+                            let _ = evt_tx.send(AppEvent::ProfileQuotaLoaded { name, quota });
                         }
                         Err(err) => {
-                            let _ = evt_tx.send(AppEvent::Error(format!("Failed to load profile {}: {}", name, err)));
+                            let _ = evt_tx.send(AppEvent::Error(format!(
+                                "Failed to fetch quota for {}: {}",
+                                name, err
+                            )));
                         }
+                    },
+                    Err(err) => {
+                        let _ = evt_tx.send(AppEvent::Error(format!(
+                            "Failed to load profile {}: {}",
+                            name, err
+                        )));
                     }
-                }
+                },
                 AppCommand::RunLogin => {
                     let previous_auth_json = config::get_auth_file()
                         .ok()
@@ -405,7 +408,8 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                         };
 
                         let mut command = Command::new(&codex_path);
-                        command.arg("login")
+                        command
+                            .arg("login")
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped());
 
@@ -418,8 +422,7 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                             }
                         }
 
-                        let mut child = match command.spawn()
-                        {
+                        let mut child = match command.spawn() {
                             Ok(child) => child,
                             Err(err) => {
                                 let _ = evt_tx.send(AppEvent::LoginFinished {
@@ -508,7 +511,8 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                 return;
                             }
 
-                            let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
+                            let runtime =
+                                tokio::runtime::Runtime::new().expect("failed to create runtime");
                             match load_profiles_with_quota(&runtime) {
                                 Ok(profiles) => {
                                     let current_quota = profiles
@@ -564,13 +568,13 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvGuard, ENV_LOCK};
     use std::env;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
-    use crate::test_support::{EnvGuard, ENV_LOCK};
 
     struct StringEnvGuard {
         key: &'static str,
@@ -667,18 +671,10 @@ mod tests {
         fs::write(temp_dir.path().join(".current_profile"), "work").unwrap();
 
         let auth_path = temp_dir.path().join("auth.json");
-        fs::write(
-            &auth_path,
-            serde_json::to_string_pretty(&old_auth).unwrap(),
-        )
-        .unwrap();
+        fs::write(&auth_path, serde_json::to_string_pretty(&old_auth).unwrap()).unwrap();
         let previous_auth_json = fs::read_to_string(&auth_path).unwrap();
 
-        fs::write(
-            &auth_path,
-            serde_json::to_string_pretty(&new_auth).unwrap(),
-        )
-        .unwrap();
+        fs::write(&auth_path, serde_json::to_string_pretty(&new_auth).unwrap()).unwrap();
 
         let _ = finalize_login(Some(previous_auth_json)).unwrap();
 
@@ -687,7 +683,10 @@ mod tests {
         let expected_value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string_pretty(&old_auth).unwrap()).unwrap();
         assert_eq!(restored_value, expected_value);
-        assert_eq!(fs::read_to_string(temp_dir.path().join(".current_profile")).unwrap(), "work");
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join(".current_profile")).unwrap(),
+            "work"
+        );
         assert!(profiles_dir.join("new").exists());
     }
 
@@ -820,7 +819,8 @@ mod tests {
             }
         }
 
-        let profiles = profiles_with_quota.expect("expected profiles loaded with quota after login");
+        let profiles =
+            profiles_with_quota.expect("expected profiles loaded with quota after login");
         assert!(profiles.iter().all(|profile| profile.quota.is_some()));
 
         cmd_tx.send(AppCommand::Shutdown).unwrap();
@@ -845,11 +845,11 @@ mod tests {
             StringEnvGuard::set("CODEX_ROUTER_CHATGPT_BASE_URL", format!("http://{addr}"));
         let server = thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            
+
             // Try to accept connection until deadline
             let (mut stream, _) = loop {
                 if std::time::Instant::now() > deadline {
-                     panic!("timed out waiting for connection");
+                    panic!("timed out waiting for connection");
                 }
                 match listener.accept() {
                     Ok(v) => break v,
@@ -861,15 +861,15 @@ mod tests {
                 }
             };
 
-             let mut buf = [0u8; 1024];
-             let _ = stream.read(&mut buf);
-             let body = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":50,"reset_at":1735689600},"secondary_window":{"used_percent":50,"reset_at":1735689600}}}"#;
-             let response = format!(
-                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                 body.len(),
-                 body
-             );
-             stream.write_all(response.as_bytes()).unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":50,"reset_at":1735689600},"secondary_window":{"used_percent":50,"reset_at":1735689600}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
         });
 
         let profiles_dir = temp_dir.path().join("profiles");
@@ -877,22 +877,28 @@ mod tests {
         // Mock valid auth
         let jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImFscGhhQGV4YW1wbGUuY29tIiwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9hbHBoYSJ9fQ.sig";
         let auth = auth::AuthDotJson {
-             openai_api_key: None,
-             tokens: Some(auth::TokenData {
-                 id_token: Some(auth::IdToken::Raw(jwt.to_string())),
-                 access_token: "access".to_string(),
-                 refresh_token: "refresh".to_string(),
-                 account_id: Some("acct_alpha".to_string()),
-             }),
-             last_refresh: None,
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: Some(auth::IdToken::Raw(jwt.to_string())),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_alpha".to_string()),
+            }),
+            last_refresh: None,
         };
-        fs::write(profiles_dir.join("alpha").join("auth.json"), serde_json::to_string(&auth).unwrap()).unwrap();
+        fs::write(
+            profiles_dir.join("alpha").join("auth.json"),
+            serde_json::to_string(&auth).unwrap(),
+        )
+        .unwrap();
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
         let handle = start_worker(cmd_rx, evt_tx);
 
-        cmd_tx.send(AppCommand::FetchProfileQuota("alpha".to_string())).unwrap();
+        cmd_tx
+            .send(AppCommand::FetchProfileQuota("alpha".to_string()))
+            .unwrap();
 
         let event = evt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         match event {
@@ -906,5 +912,59 @@ mod tests {
         cmd_tx.send(AppCommand::Shutdown).unwrap();
         handle.join().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn test_load_profiles_marks_expired_on_401() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _base_url_guard =
+            StringEnvGuard::set("CODEX_ROUTER_CHATGPT_BASE_URL", format!("http://{addr}"));
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = "Unauthorized";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: None,
+                access_token: "expired-token".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("expired_profile")).unwrap();
+        fs::write(
+            profiles_dir.join("expired_profile").join("auth.json"),
+            serde_json::to_string_pretty(&auth).unwrap(),
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let profiles = load_profiles_with_quota(&runtime).unwrap();
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "expired_profile");
+        assert_eq!(profiles[0].is_valid, false);
+        assert!(profiles[0].quota.is_none());
+
+        server_thread.join().unwrap();
     }
 }

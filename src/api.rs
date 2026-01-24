@@ -30,8 +30,13 @@ pub struct QuotaInfo {
     pub secondary_reset_date: Option<String>,
 }
 
-impl QuotaInfo {
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("Token expired")]
+    Expired,
 }
+
+impl QuotaInfo {}
 
 #[derive(Debug, Clone, Deserialize)]
 struct CodexUsagePayload {
@@ -99,23 +104,34 @@ pub async fn fetch_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
         .map(|t| t.access_token.clone())
         .or_else(|| auth.openai_api_key.clone())
         .context("No valid token found")?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
     if auth.tokens.is_some() && auth.openai_api_key.is_none() {
-        let mut failures: Vec<String> = Vec::new();
+        let mut failures: Vec<anyhow::Error> = Vec::new();
         for url in codex_usage_urls() {
             match fetch_quota_with_client(&client, auth, &url).await {
                 Ok(quota) => return Ok(quota),
                 Err(err) => {
                     tracing::warn!(url = %url, error = %err, "quota request failed");
-                    failures.push(err.to_string());
+                    failures.push(err);
                 }
             }
         }
         if !failures.is_empty() {
-            anyhow::bail!("All quota endpoints failed:\n{}", failures.join("\n"));
+            if failures
+                .iter()
+                .any(|e| e.downcast_ref::<AuthError>().is_some())
+            {
+                return Err(AuthError::Expired.into());
+            }
+            anyhow::bail!(
+                "All quota endpoints failed:\n{}",
+                failures
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
         }
         anyhow::bail!("No quota endpoints configured");
     }
@@ -198,19 +214,16 @@ async fn fetch_quota_with_client(
         Ok(resp) => {
             let status = resp.status();
             let error = resp.text().await.unwrap_or_default();
-            if status == StatusCode::UNAUTHORIZED
-                && auth.openai_api_key.is_none()
-                && auth.tokens.is_some()
-                && should_fallback_on_unauthorized(&error)
-            {
-                return get_fallback_quota(auth);
+            if status == StatusCode::UNAUTHORIZED {
+                if auth.openai_api_key.is_none()
+                    && auth.tokens.is_some()
+                    && should_fallback_on_unauthorized(&error)
+                {
+                    return get_fallback_quota(auth);
+                }
+                return Err(AuthError::Expired.into());
             }
-            anyhow::bail!(
-                "API returned status {} for {}: {}",
-                status,
-                url,
-                error
-            );
+            anyhow::bail!("API returned status {} for {}: {}", status, url, error);
         }
         Err(e) => {
             anyhow::bail!("API request failed for {}: {}", url, e);
@@ -277,8 +290,6 @@ fn format_plan_type_with_credits(plan_type: String, credits: Option<&CodexCredit
     };
     format!("{plan_type} (credits: {balance})")
 }
-
-
 
 fn codex_usage_urls() -> Vec<String> {
     let configured = env::var("CODEX_ROUTER_CHATGPT_BASE_URL")

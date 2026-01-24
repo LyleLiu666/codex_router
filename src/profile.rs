@@ -9,6 +9,7 @@ pub struct ProfileSummary {
     pub name: String,
     pub email: Option<String>,
     pub is_current: bool,
+    pub is_valid: bool,
     pub quota: Option<crate::api::QuotaInfo>,
 }
 
@@ -48,6 +49,7 @@ pub fn list_profiles_data() -> Result<Vec<ProfileSummary>> {
             name,
             email,
             is_current,
+            is_valid: true,
             quota: None,
         });
     }
@@ -60,11 +62,11 @@ pub fn list_profiles_data() -> Result<Vec<ProfileSummary>> {
 pub fn load_profile_auth(profile_name: &str) -> Result<AuthDotJson> {
     let profiles_dir = get_profiles_dir()?;
     let profile_auth_file = profiles_dir.join(profile_name).join("auth.json");
-    
+
     if !profile_auth_file.exists() {
         anyhow::bail!("Profile '{}' not found.", profile_name);
     }
-    
+
     let auth_json = fs::read_to_string(&profile_auth_file)?;
     let auth: AuthDotJson = serde_json::from_str(&auth_json)?;
     Ok(auth)
@@ -324,13 +326,18 @@ pub fn save_profile(profile_name: &str) -> Result<SaveProfileOutcome> {
 
             fs::write(&existing_auth_file, serde_json::to_string_pretty(&auth)?)?;
             save_current_profile(&existing_name)?;
-            return Ok(SaveProfileOutcome::Updated { name: existing_name });
+            return Ok(SaveProfileOutcome::Updated {
+                name: existing_name,
+            });
         }
     }
 
     let profile_dir = profiles_dir.join(profile_name);
     if profile_dir.exists() {
-        anyhow::bail!("Profile '{}' already exists. Delete it first.", profile_name);
+        anyhow::bail!(
+            "Profile '{}' already exists. Delete it first.",
+            profile_name
+        );
     }
 
     fs::create_dir(&profile_dir)?;
@@ -378,7 +385,9 @@ pub fn save_auth_as_profile_without_switch(auth: &AuthDotJson) -> Result<SavePro
             }
 
             fs::write(&existing_auth_file, serde_json::to_string_pretty(auth)?)?;
-            return Ok(SaveProfileOutcome::Updated { name: existing_name });
+            return Ok(SaveProfileOutcome::Updated {
+                name: existing_name,
+            });
         }
     }
 
@@ -466,9 +475,7 @@ pub fn delete_profile(profile_name: &str) -> Result<()> {
     // Don't allow deleting the current profile
     if let Some(current) = get_current_profile()? {
         if current == profile_name {
-            anyhow::bail!(
-                "Cannot delete the current profile. Switch to another profile first."
-            );
+            anyhow::bail!("Cannot delete the current profile. Switch to another profile first.");
         }
     }
 

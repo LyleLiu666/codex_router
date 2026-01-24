@@ -7,12 +7,12 @@ use axum::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
-use crate::shared::SharedState;
-use crate::profile::ProfileSummary;
 use crate::auth;
+use crate::profile::ProfileSummary;
+use crate::shared::SharedState;
 
 pub async fn start_server(state: Arc<SharedState>) {
     // Add CORS layer to allow all origins/methods/headers for local dev
@@ -29,7 +29,7 @@ pub async fn start_server(state: Arc<SharedState>) {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9876));
     tracing::info!("Listening on {}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -63,22 +63,23 @@ async fn handle_chat_completions(
 
     if candidates.is_empty() {
         return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE, 
-            Json(serde_json::json!({"error": "No available accounts with quota"}))
-        ).into_response();
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "No available accounts with quota"})),
+        )
+            .into_response();
     }
 
     // 3. Try Candidates
     let client = reqwest::Client::new();
-    
+
     // Reconstruct body
     let body_json = serde_json::to_value(&payload).unwrap();
     // Flatten extra fields back if needed, but serde already handled it in struct via flattened `extra`.
     // Actually, `serde_json::to_value` on `ChatRequest` will produce the correct structure including flattened extra.
-    
+
     for profile in candidates {
         tracing::info!("Trying profile: {}", profile.name);
-        
+
         // Load auth
         let auth = match crate::profile::load_profile_auth(&profile.name) {
             Ok(a) => a,
@@ -106,15 +107,16 @@ async fn handle_chat_completions(
         // Let's use `https://api.openai.com/v1/chat/completions` as default fallback or check env.
         // Actually, the user requirement mentions `gpt-5.2-codex` etc. which implies it might proxy to Codex backend or OpenAI.
         // If it's Codex backend, we need `ChatGPT-Account-Id`.
-        
-        let url = "https://api.openai.com/v1/chat/completions"; 
 
-        let mut req = client.post(url)
+        let url = "https://api.openai.com/v1/chat/completions";
+
+        let mut req = client
+            .post(url)
             .header("Authorization", format!("Bearer {}", access_token))
             .json(&body_json);
-            
+
         if let Some(account_id) = auth::get_account_id(&auth) {
-             req = req.header("ChatGPT-Account-Id", account_id);
+            req = req.header("ChatGPT-Account-Id", account_id);
         }
 
         match req.send().await {
@@ -122,25 +124,33 @@ async fn handle_chat_completions(
                 if resp.status().is_success() {
                     // Success! Stream response back.
                     let status = resp.status();
-                    let headers = resp.headers().clone(); 
+                    let headers = resp.headers().clone();
                     let body = axum::body::Body::from_stream(resp.bytes_stream());
-                    
+
                     let mut builder = Response::builder().status(status);
                     for (key, value) in &headers {
                         builder = builder.header(key, value);
                     }
                     return builder.body(body).unwrap_or_default();
                 } else if resp.status() == 429 {
-                     tracing::warn!("Profile {} rate limited (429), trying next", profile.name);
-                     continue;
+                    tracing::warn!("Profile {} rate limited (429), trying next", profile.name);
+                    continue;
                 } else if resp.status() == 401 || resp.status() == 403 {
-                     tracing::warn!("Profile {} auth error ({}), trying next", profile.name, resp.status());
-                     continue;
+                    tracing::warn!(
+                        "Profile {} auth error ({}), trying next",
+                        profile.name,
+                        resp.status()
+                    );
+                    continue;
                 } else {
-                     // Other errors (500 etc), maybe temporary, or fatal?
-                     // Let's assume we try next for robustness.
-                     tracing::warn!("Profile {} error {}, trying next", profile.name, resp.status());
-                     continue;
+                    // Other errors (500 etc), maybe temporary, or fatal?
+                    // Let's assume we try next for robustness.
+                    tracing::warn!(
+                        "Profile {} error {}, trying next",
+                        profile.name,
+                        resp.status()
+                    );
+                    continue;
                 }
             }
             Err(e) => {
@@ -152,29 +162,39 @@ async fn handle_chat_completions(
 
     (
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({"error": "All accounts failed or exhausted"}))
-    ).into_response()
+        Json(serde_json::json!({"error": "All accounts failed or exhausted"})),
+    )
+        .into_response()
 }
 
 fn select_candidates(profiles: Vec<ProfileSummary>) -> Vec<ProfileSummary> {
-    let mut candidates: Vec<ProfileSummary> = profiles.into_iter()
+    let mut candidates: Vec<ProfileSummary> = profiles
+        .into_iter()
         .filter(|p| {
             if let Some(quota) = &p.quota {
                 let used = quota.used_tokens.unwrap_or(0);
                 let total = quota.total_tokens.unwrap_or(100);
                 used < total
             } else {
-                false 
+                false
             }
         })
         .collect();
 
     candidates.sort_by(|a, b| {
-        let date_a = a.quota.as_ref().and_then(|q| q.secondary_reset_date.as_deref()).unwrap_or("z"); // "z" to put None at end
-        let date_b = b.quota.as_ref().and_then(|q| q.secondary_reset_date.as_deref()).unwrap_or("z");
+        let date_a = a
+            .quota
+            .as_ref()
+            .and_then(|q| q.secondary_reset_date.as_deref())
+            .unwrap_or("z"); // "z" to put None at end
+        let date_b = b
+            .quota
+            .as_ref()
+            .and_then(|q| q.secondary_reset_date.as_deref())
+            .unwrap_or("z");
         date_a.cmp(date_b)
     });
-    
+
     candidates
 }
 
@@ -188,6 +208,7 @@ mod tests {
             name: name.to_string(),
             email: None,
             is_current: false,
+            is_valid: true,
             quota: Some(QuotaInfo {
                 account_id: "id".to_string(),
                 email: "email".to_string(),
@@ -207,7 +228,7 @@ mod tests {
         let p1 = mock_profile("p1", 50, 100, Some("2026-01-20T10:00:00Z"));
         let p2 = mock_profile("p2", 50, 100, Some("2026-01-19T10:00:00Z")); // Earlier
         let p3 = mock_profile("p3", 50, 100, Some("2026-01-21T10:00:00Z"));
-        
+
         let candidates = select_candidates(vec![p1, p2, p3]);
         assert_eq!(candidates[0].name, "p2");
         assert_eq!(candidates[1].name, "p1");
@@ -218,7 +239,7 @@ mod tests {
     fn test_select_candidates_filters_exhausted() {
         let p1 = mock_profile("p1", 50, 100, Some("2026-01-20T10:00:00Z"));
         let p2 = mock_profile("p2", 100, 100, Some("2026-01-19T10:00:00Z")); // Exhausted
-        
+
         let candidates = select_candidates(vec![p1, p2]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "p1");

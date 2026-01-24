@@ -7,12 +7,11 @@ use eframe::egui;
 
 use crate::app_state::{AppCommand, AppEvent, AppState};
 use crate::refresh::RefreshSchedule;
+use crate::shared::SharedState;
 use crate::state::{self, RouterState};
 use crate::tray::{self, TrayEvent, TrayHandle};
 use crate::worker;
-use crate::shared::SharedState;
 use std::sync::Arc;
-
 
 pub struct RouterApp {
     state: AppState,
@@ -40,12 +39,15 @@ impl RouterApp {
         };
 
         let shared_state = Arc::new(SharedState::new());
-        let server_state = shared_state.clone();
-        
+
         // Start API server
-        tokio::spawn(async move {
-            crate::server::start_server(server_state).await;
-        });
+        #[cfg(not(test))]
+        {
+            let server_state = shared_state.clone();
+            tokio::spawn(async move {
+                crate::server::start_server(server_state).await;
+            });
+        }
 
         let mut state = AppState::default();
         let router_state = match state::load_state() {
@@ -123,7 +125,7 @@ fn format_reset_time(utc_str: Option<&str>) -> String {
 
     // Convert to local time
     let local_time = utc_time.with_timezone(&Local);
-    
+
     // Format as "YYYY-MM-DD HH:MM (local)"
     local_time.format("%Y-%m-%d %H:%M (local)").to_string()
 }
@@ -187,15 +189,19 @@ impl eframe::App for RouterApp {
             }
             let event_for_shared = event.clone();
             self.state.apply_event(event);
-            if matches!(event_for_shared, AppEvent::ProfilesLoaded(_) | AppEvent::QuotaLoaded(_) | AppEvent::ProfileQuotaLoaded { .. }) {
-                 self.shared_state.update_profiles(self.state.profiles.clone());
+            if matches!(
+                event_for_shared,
+                AppEvent::ProfilesLoaded(_)
+                    | AppEvent::QuotaLoaded(_)
+                    | AppEvent::ProfileQuotaLoaded { .. }
+            ) {
+                self.shared_state
+                    .update_profiles(self.state.profiles.clone());
             }
             if is_profiles_loaded {
                 let next_profile = self.state.current_profile.clone();
-                if should_fetch_on_profile_change(
-                    prev_profile.as_deref(),
-                    next_profile.as_deref(),
-                ) {
+                if should_fetch_on_profile_change(prev_profile.as_deref(), next_profile.as_deref())
+                {
                     self.router_state.last_selected_profile = next_profile;
                     self.persist_router_state();
                     let _ = self.cmd_tx.send(AppCommand::FetchQuota);
@@ -222,189 +228,202 @@ impl eframe::App for RouterApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Codex Router");
+                ui.heading("Codex Router");
 
-            ui.group(|ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label("Profiles");
-                    if ui.button("Refresh").clicked() {
-                        let _ = self.cmd_tx.send(AppCommand::FetchQuota);
-                        self.quota_refresh.clear();
-                    }
-
-                    let mut auto_refresh_enabled = self.state.auto_refresh_enabled;
-                    if ui
-                        .checkbox(&mut auto_refresh_enabled, "Auto refresh")
-                        .changed()
-                    {
-                        let interval_seconds = self.state.refresh_interval_seconds;
-                        let changed = update_router_state_settings(
-                            &mut self.router_state,
-                            &mut self.state,
-                            interval_seconds,
-                            auto_refresh_enabled,
-                        );
-                        if changed {
-                            self.persist_router_state();
-                        }
-                        self.quota_refresh.clear();
-                        if auto_refresh_enabled {
+                ui.group(|ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label("Profiles");
+                        if ui.button("Refresh").clicked() {
                             let _ = self.cmd_tx.send(AppCommand::FetchQuota);
-                        }
-                    }
-
-                    let mut interval_minutes = (self.state.refresh_interval_seconds / 60).max(1);
-                    let response = ui.add(
-                        egui::DragValue::new(&mut interval_minutes)
-                            .range(1..=120)
-                            .suffix(" min"),
-                    );
-                    if response.changed() {
-                        let interval_seconds = interval_minutes.saturating_mul(60);
-                        let auto_refresh_enabled = self.state.auto_refresh_enabled;
-                        let changed = update_router_state_settings(
-                            &mut self.router_state,
-                            &mut self.state,
-                            interval_seconds,
-                            auto_refresh_enabled,
-                        );
-                        if changed {
-                            self.persist_router_state();
                             self.quota_refresh.clear();
                         }
-                    }
-                });
 
-                if self.state.profiles.is_empty() {
-                    ui.label("No profiles yet. Save current login or run codex login.");
-                }
+                        let mut auto_refresh_enabled = self.state.auto_refresh_enabled;
+                        if ui
+                            .checkbox(&mut auto_refresh_enabled, "Auto refresh")
+                            .changed()
+                        {
+                            let interval_seconds = self.state.refresh_interval_seconds;
+                            let changed = update_router_state_settings(
+                                &mut self.router_state,
+                                &mut self.state,
+                                interval_seconds,
+                                auto_refresh_enabled,
+                            );
+                            if changed {
+                                self.persist_router_state();
+                            }
+                            self.quota_refresh.clear();
+                            if auto_refresh_enabled {
+                                let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+                            }
+                        }
 
-                for profile in &self.state.profiles {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let profile_label = match &profile.email {
-                            Some(email) => format!("{} ({})", profile.name, email),
-                            None => profile.name.clone(),
-                        };
-                        ui.strong(&profile_label);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("⟳").clicked() {
-                                let _ = self.cmd_tx.send(AppCommand::FetchProfileQuota(profile.name.clone()));
+                        let mut interval_minutes =
+                            (self.state.refresh_interval_seconds / 60).max(1);
+                        let response = ui.add(
+                            egui::DragValue::new(&mut interval_minutes)
+                                .range(1..=120)
+                                .suffix(" min"),
+                        );
+                        if response.changed() {
+                            let interval_seconds = interval_minutes.saturating_mul(60);
+                            let auto_refresh_enabled = self.state.auto_refresh_enabled;
+                            let changed = update_router_state_settings(
+                                &mut self.router_state,
+                                &mut self.state,
+                                interval_seconds,
+                                auto_refresh_enabled,
+                            );
+                            if changed {
+                                self.persist_router_state();
+                                self.quota_refresh.clear();
                             }
-                            if profile.is_current {
-                                ui.add_enabled(false, egui::Button::new("Current"));
-                            } else if ui.button("Switch").clicked() {
-                                let _ = self
-                                    .cmd_tx
-                                    .send(AppCommand::SwitchProfile(profile.name.clone()));
-                            }
-                        });
+                        }
                     });
 
-                    if let Some(quota) = &profile.quota {
-                        egui::Grid::new(format!("quota_grid_{}", profile.name))
-                            .num_columns(2)
-                            .spacing([10.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Plan");
-                                ui.label(&quota.plan_type);
-                                ui.end_row();
-
-                                ui.label("Primary");
-                                ui.label(match quota.used_requests {
-                                    Some(used) => {
-                                        let total = quota.total_requests.unwrap_or(100);
-                                        let left = total.saturating_sub(used.min(total));
-                                        format!("{}% used ({}% left)", used.min(total), left)
-                                    }
-                                    None => "-".to_string(),
-                                });
-                                ui.end_row();
-
-                                ui.label("Secondary");
-                                ui.label(match quota.used_tokens {
-                                    Some(used) => {
-                                        let total = quota.total_tokens.unwrap_or(100);
-                                        let left = total.saturating_sub(used.min(total));
-                                        format!("{}% used ({}% left)", used.min(total), left)
-                                    }
-                                    None => "-".to_string(),
-                                });
-                                ui.end_row();
-
-                                ui.label("Reset (Primary)");
-                                ui.label(format_reset_time(quota.reset_date.as_deref()));
-                                ui.end_row();
-
-                                ui.label("Reset (Secondary)");
-                                ui.label(format_reset_time(quota.secondary_reset_date.as_deref()));
-                                ui.end_row();
-                            });
-                    } else {
-                        ui.label("Loading quota...");
+                    if self.state.profiles.is_empty() {
+                        ui.label("No profiles yet. Save current login or run codex login.");
                     }
-                }
-            });
 
-            if let Some(error) = &self.state.error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
+                    for profile in &self.state.profiles {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let profile_label = match &profile.email {
+                                Some(email) => format!("{} ({})", profile.name, email),
+                                None => profile.name.clone(),
+                            };
+                            ui.strong(&profile_label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("⟳").clicked() {
+                                        let _ = self.cmd_tx.send(AppCommand::FetchProfileQuota(
+                                            profile.name.clone(),
+                                        ));
+                                    }
+                                    if profile.is_current {
+                                        ui.add_enabled(false, egui::Button::new("Current"));
+                                    } else if ui.button("Switch").clicked() {
+                                        let _ = self
+                                            .cmd_tx
+                                            .send(AppCommand::SwitchProfile(profile.name.clone()));
+                                    }
+                                },
+                            );
+                        });
 
-            ui.separator();
+                        if let Some(quota) = &profile.quota {
+                            egui::Grid::new(format!("quota_grid_{}", profile.name))
+                                .num_columns(2)
+                                .spacing([10.0, 2.0])
+                                .show(ui, |ui| {
+                                    ui.label("Plan");
+                                    ui.label(&quota.plan_type);
+                                    ui.end_row();
 
-            ui.horizontal(|ui| {
-                ui.label("Save as");
-                ui.text_edit_singleline(&mut self.state.profile_name_input);
-                let trimmed = self.state.profile_name_input.trim().to_string();
-                if ui
-                    .add_enabled(!trimmed.is_empty(), egui::Button::new("Save Current Profile"))
-                    .clicked()
-                {
-                    let _ = self.cmd_tx.send(AppCommand::SaveProfile(trimmed));
-                    self.state.profile_name_input.clear();
-                }
-            });
+                                    ui.label("Primary");
+                                    ui.label(match quota.used_requests {
+                                        Some(used) => {
+                                            let total = quota.total_requests.unwrap_or(100);
+                                            let left = total.saturating_sub(used.min(total));
+                                            format!("{}% used ({}% left)", used.min(total), left)
+                                        }
+                                        None => "-".to_string(),
+                                    });
+                                    ui.end_row();
 
-            if let Some(message) = &self.state.profile_message {
-                ui.label(message);
-            }
+                                    ui.label("Secondary");
+                                    ui.label(match quota.used_tokens {
+                                        Some(used) => {
+                                            let total = quota.total_tokens.unwrap_or(100);
+                                            let left = total.saturating_sub(used.min(total));
+                                            format!("{}% used ({}% left)", used.min(total), left)
+                                        }
+                                        None => "-".to_string(),
+                                    });
+                                    ui.end_row();
 
-            ui.separator();
+                                    ui.label("Reset (Primary)");
+                                    ui.label(format_reset_time(quota.reset_date.as_deref()));
+                                    ui.end_row();
 
-            ui.horizontal(|ui| {
-                ui.label("Login");
-                let run_button = ui.add_enabled(
-                    !self.state.login_running,
-                    egui::Button::new("Run codex login"),
-                );
-                if run_button.clicked() {
-                    let _ = self.cmd_tx.send(AppCommand::RunLogin);
-                }
-                if self.state.login_running {
-                    ui.label("Running…");
-                    if ui.button("Cancel").clicked() {
-                        let _ = self.cmd_tx.send(AppCommand::CancelLogin);
+                                    ui.label("Reset (Secondary)");
+                                    ui.label(format_reset_time(
+                                        quota.secondary_reset_date.as_deref(),
+                                    ));
+                                    ui.end_row();
+                                });
+                        } else {
+                            ui.label("Loading quota...");
+                        }
                     }
-                }
-            });
+                });
 
-            if let Some(url) = &self.state.login_url {
+                if let Some(error) = &self.state.error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+
+                ui.separator();
+
                 ui.horizontal(|ui| {
-                    ui.label(url);
-                    if ui.button("Open URL").clicked() {
-                        let _ = self.cmd_tx.send(AppCommand::OpenLoginUrl(url.clone()));
+                    ui.label("Save as");
+                    ui.text_edit_singleline(&mut self.state.profile_name_input);
+                    let trimmed = self.state.profile_name_input.trim().to_string();
+                    if ui
+                        .add_enabled(
+                            !trimmed.is_empty(),
+                            egui::Button::new("Save Current Profile"),
+                        )
+                        .clicked()
+                    {
+                        let _ = self.cmd_tx.send(AppCommand::SaveProfile(trimmed));
+                        self.state.profile_name_input.clear();
                     }
                 });
-            }
-            if let Some(code) = &self.state.login_code {
-                ui.label(format!("Code: {code}"));
-            }
-            if !self.state.login_output.is_empty() {
-                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                    ui.monospace(&self.state.login_output);
+
+                if let Some(message) = &self.state.profile_message {
+                    ui.label(message);
+                }
+
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("Login");
+                    let run_button = ui.add_enabled(
+                        !self.state.login_running,
+                        egui::Button::new("Run codex login"),
+                    );
+                    if run_button.clicked() {
+                        let _ = self.cmd_tx.send(AppCommand::RunLogin);
+                    }
+                    if self.state.login_running {
+                        ui.label("Running…");
+                        if ui.button("Cancel").clicked() {
+                            let _ = self.cmd_tx.send(AppCommand::CancelLogin);
+                        }
+                    }
                 });
-            }
+
+                if let Some(url) = &self.state.login_url {
+                    ui.horizontal(|ui| {
+                        ui.label(url);
+                        if ui.button("Open URL").clicked() {
+                            let _ = self.cmd_tx.send(AppCommand::OpenLoginUrl(url.clone()));
+                        }
+                    });
+                }
+                if let Some(code) = &self.state.login_code {
+                    ui.label(format!("Code: {code}"));
+                }
+                if !self.state.login_output.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.state.login_output);
+                        });
+                }
             }); // ScrollArea
         }); // CentralPanel
 
@@ -441,7 +460,9 @@ mod tests {
     use crate::refresh::RefreshSchedule;
     use std::time::{Duration, Instant};
 
-    fn switchable_profiles(profiles: &[crate::profile::ProfileSummary]) -> Vec<crate::profile::ProfileSummary> {
+    fn switchable_profiles(
+        profiles: &[crate::profile::ProfileSummary],
+    ) -> Vec<crate::profile::ProfileSummary> {
         profiles
             .iter()
             .filter(|profile| !profile.is_current)
@@ -490,12 +511,14 @@ mod tests {
                 name: "work".to_string(),
                 email: Some("work@example.com".to_string()),
                 is_current: true,
+                is_valid: true,
                 quota: None,
             },
             ProfileSummary {
                 name: "personal".to_string(),
                 email: Some("personal@example.com".to_string()),
                 is_current: false,
+                is_valid: true,
                 quota: None,
             },
         ];

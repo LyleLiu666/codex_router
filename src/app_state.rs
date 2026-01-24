@@ -33,7 +33,10 @@ pub enum AppEvent {
         message: String,
     },
     QuotaLoaded(QuotaInfo),
-    ProfileQuotaLoaded { name: String, quota: QuotaInfo },
+    ProfileQuotaLoaded {
+        name: String,
+        quota: QuotaInfo,
+    },
     Error(String),
 }
 
@@ -151,6 +154,7 @@ mod tests {
             name: "work".to_string(),
             email: None,
             is_current: true,
+            is_valid: true,
             quota: None,
         }
     }
@@ -169,7 +173,10 @@ mod tests {
         state.apply_event(AppEvent::ProfileSaved(SaveProfileOutcome::Created {
             name: "work".to_string(),
         }));
-        assert_eq!(state.profile_message.as_deref(), Some("Saved profile: work"));
+        assert_eq!(
+            state.profile_message.as_deref(),
+            Some("Saved profile: work")
+        );
     }
 
     #[test]

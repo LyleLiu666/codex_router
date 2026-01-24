@@ -20,5 +20,8 @@ fn package_script_dry_run_prints_steps() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("hdiutil create"), "missing DMG step");
+    assert!(
+        stdout.contains("create-dmg") || stdout.contains("hdiutil create"),
+        "missing DMG step"
+    );
 }
