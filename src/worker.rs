@@ -241,7 +241,7 @@ fn load_profiles_with_quota(
 ) -> anyhow::Result<Vec<profile::ProfileSummary>> {
     let mut profiles = profile::list_profiles_data()?;
     for profile_summary in &mut profiles {
-        let auth = match profile::load_profile_auth(&profile_summary.name) {
+        let mut auth = match profile::load_profile_auth(&profile_summary.name) {
             Ok(auth) => auth,
             Err(_) => continue,
         };
@@ -251,7 +251,68 @@ fn load_profiles_with_quota(
             }
             Err(err) => {
                 if let Some(api::AuthError::Expired) = err.downcast_ref::<api::AuthError>() {
-                    profile_summary.is_valid = false;
+                    // Attempt to refresh the token
+                    if let Some(ref tokens) = auth.tokens {
+                        tracing::info!(
+                            profile = %profile_summary.name,
+                            "Access token expired, attempting refresh"
+                        );
+                        match runtime.block_on(api::refresh_token(&tokens.refresh_token)) {
+                            Ok(refresh_response) => {
+                                // Update auth with new tokens
+                                if let Some(ref mut tokens) = auth.tokens {
+                                    if let Some(new_access) = refresh_response.access_token {
+                                        tokens.access_token = new_access;
+                                    }
+                                    if let Some(new_refresh) = refresh_response.refresh_token {
+                                        tokens.refresh_token = new_refresh;
+                                    }
+                                    // Note: id_token update requires parsing, skip for now
+                                }
+                                auth.last_refresh = Some(chrono::Utc::now());
+
+                                // Save updated auth to profile
+                                if let Err(save_err) =
+                                    profile::save_profile_auth(&profile_summary.name, &auth)
+                                {
+                                    tracing::warn!(
+                                        profile = %profile_summary.name,
+                                        error = %save_err,
+                                        "Failed to save refreshed tokens"
+                                    );
+                                }
+
+                                // Retry quota fetch with new tokens
+                                match runtime.block_on(api::fetch_quota(&auth)) {
+                                    Ok(quota) => {
+                                        profile_summary.quota = Some(quota);
+                                        tracing::info!(
+                                            profile = %profile_summary.name,
+                                            "Token refresh successful"
+                                        );
+                                    }
+                                    Err(retry_err) => {
+                                        tracing::warn!(
+                                            profile = %profile_summary.name,
+                                            error = %retry_err,
+                                            "Quota fetch failed after token refresh"
+                                        );
+                                        profile_summary.is_valid = false;
+                                    }
+                                }
+                            }
+                            Err(refresh_err) => {
+                                tracing::warn!(
+                                    profile = %profile_summary.name,
+                                    error = %refresh_err,
+                                    "Token refresh failed"
+                                );
+                                profile_summary.is_valid = false;
+                            }
+                        }
+                    } else {
+                        profile_summary.is_valid = false;
+                    }
                 }
             }
         }

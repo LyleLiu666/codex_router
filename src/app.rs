@@ -355,6 +355,11 @@ impl eframe::App for RouterApp {
                                     ));
                                     ui.end_row();
                                 });
+                        } else if !profile.is_valid {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 165, 0),
+                                "⚠ Login expired. Please run 'codex login' and refresh.",
+                            );
                         } else {
                             ui.label("Loading quota...");
                         }

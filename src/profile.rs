@@ -72,6 +72,21 @@ pub fn load_profile_auth(profile_name: &str) -> Result<AuthDotJson> {
     Ok(auth)
 }
 
+/// Save auth data for a specific profile
+pub fn save_profile_auth(profile_name: &str, auth: &AuthDotJson) -> Result<()> {
+    let profiles_dir = get_profiles_dir()?;
+    let profile_dir = profiles_dir.join(profile_name);
+
+    if !profile_dir.exists() {
+        anyhow::bail!("Profile '{}' not found.", profile_name);
+    }
+
+    let profile_auth_file = profile_dir.join("auth.json");
+    let auth_json = serde_json::to_string_pretty(auth)?;
+    fs::write(&profile_auth_file, auth_json)?;
+    Ok(())
+}
+
 fn token_fingerprint(auth: &AuthDotJson) -> Option<String> {
     if let Some(key) = &auth.openai_api_key {
         return Some(key.clone());

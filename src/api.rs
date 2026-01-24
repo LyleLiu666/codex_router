@@ -16,6 +16,10 @@ const DEFAULT_CHATGPT_FALLBACK_BASE_URL: &str = "https://chat.openai.com/backend
 const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_USER_AGENT: &str = "codex-cli";
 
+// OAuth token refresh constants
+const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
 /// Quota information
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct QuotaInfo {
@@ -395,6 +399,58 @@ fn get_fallback_quota(auth: &auth::AuthDotJson) -> Result<QuotaInfo> {
         reset_date: None,
         secondary_reset_date: None,
     })
+}
+
+// OAuth token refresh types
+
+#[derive(Serialize)]
+struct RefreshRequest<'a> {
+    client_id: &'a str,
+    grant_type: &'a str,
+    refresh_token: &'a str,
+    scope: &'a str,
+}
+
+#[derive(Deserialize)]
+pub struct RefreshResponse {
+    pub id_token: Option<String>,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+}
+
+/// Refresh expired OAuth tokens using the refresh_token grant
+pub async fn refresh_token(refresh_token: &str) -> Result<RefreshResponse> {
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+
+    let request = RefreshRequest {
+        client_id: CLIENT_ID,
+        grant_type: "refresh_token",
+        refresh_token,
+        scope: "openid profile email",
+    };
+
+    let response = client
+        .post(REFRESH_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .context("Failed to send refresh token request")?;
+
+    let status = response.status();
+    if status.is_success() {
+        let refresh_response: RefreshResponse = response
+            .json()
+            .await
+            .context("Failed to parse refresh token response")?;
+        Ok(refresh_response)
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        if status == StatusCode::UNAUTHORIZED {
+            anyhow::bail!("Refresh token expired or invalid: {}", body);
+        }
+        anyhow::bail!("Failed to refresh token: {} - {}", status, body);
+    }
 }
 
 #[cfg(test)]
