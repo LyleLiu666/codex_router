@@ -207,63 +207,67 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                         let runtime =
                             tokio::runtime::Runtime::new().expect("failed to create runtime");
 
-                        let res = runtime.block_on(async {
-                            oauth::start_login_flow(|code, url| {
-                                let _ = evt_tx.send(AppEvent::LoginOutput {
-                                    output: format!("Please open: {}\nCode: {}\n", url, code),
-                                    parsed: login_output::LoginOutput {
-                                        url: Some(url),
-                                        code: Some(code),
-                                    },
-                                    running: true,
-                                });
-                            })
-                            .await
+                        let evt_tx_clone = evt_tx.clone();
+                        let res = oauth::run_codex_login(move |line| {
+                            let _ = evt_tx_clone.send(AppEvent::LoginOutput {
+                                output: line.clone(),
+                                parsed: login_output::LoginOutput {
+                                    url: None,
+                                    code: None,
+                                },
+                                running: true,
+                            });
                         });
 
                         match res {
-                            Ok(auth_result) => {
-                                let auth_data = auth::AuthDotJson {
-                                    openai_api_key: None,
-                                    tokens: Some(auth::TokenData {
-                                        access_token: auth_result.access_token,
-                                        refresh_token: auth_result.refresh_token,
-                                        id_token: auth_result.id_token.map(auth::IdToken::Raw),
-                                        account_id: None,
-                                    }),
-                                    last_refresh: None,
-                                };
+                            Ok(()) => {
+                                // codex login succeeded - read auth from official location
+                                match auth::load_auth() {
+                                    Ok(auth_data) => {
+                                        let _ = evt_tx.send(AppEvent::LoginFinished {
+                                            success: true,
+                                            message: "Login successful".into(),
+                                        });
 
-                                let _ = evt_tx.send(AppEvent::LoginFinished {
-                                    success: true,
-                                    message: "Login successful".into(),
-                                });
+                                        if let Err(err) = finalize_login(auth_data) {
+                                            let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                                            return;
+                                        }
 
-                                if let Err(err) = finalize_login(auth_data) {
-                                    let _ = evt_tx.send(AppEvent::Error(err.to_string()));
-                                    return;
-                                }
-
-                                match load_profiles_with_quota(&runtime) {
-                                    Ok(profiles) => {
-                                        let current_quota = profiles
-                                            .iter()
-                                            .find(|profile| profile.is_current)
-                                            .and_then(|profile| profile.quota.clone());
-                                        let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
-                                        if let Some(quota) = current_quota {
-                                            let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
+                                        match load_profiles_with_quota(&runtime) {
+                                            Ok(profiles) => {
+                                                let current_quota = profiles
+                                                    .iter()
+                                                    .find(|profile| profile.is_current)
+                                                    .and_then(|profile| profile.quota.clone());
+                                                let _ =
+                                                    evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                                                if let Some(quota) = current_quota {
+                                                    let _ =
+                                                        evt_tx.send(AppEvent::QuotaLoaded(quota));
+                                                }
+                                            }
+                                            Err(err) => {
+                                                let _ =
+                                                    evt_tx.send(AppEvent::Error(err.to_string()));
+                                            }
                                         }
                                     }
                                     Err(err) => {
-                                        let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                                        let _ = evt_tx.send(AppEvent::LoginFinished {
+                                            success: false,
+                                            message: format!(
+                                                "Failed to read auth after login: {}",
+                                                err
+                                            ),
+                                        });
                                     }
                                 }
                             }
-                            Err(e) => {
+                            Err(err) => {
                                 let _ = evt_tx.send(AppEvent::LoginFinished {
                                     success: false,
-                                    message: e.to_string(),
+                                    message: format!("Login failed: {}", err),
                                 });
                             }
                         }
