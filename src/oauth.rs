@@ -2,17 +2,23 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
+use crate::config::get_codex_home;
+
 /// Run `codex login` CLI command and stream output.
 ///
-/// This function spawns `codex login` as a subprocess and calls the provided
-/// callback with each line of output. After the command completes successfully,
-/// it reads the resulting auth.json from the official codex location.
+/// This function spawns `codex login` as a subprocess with the correct
+/// CODEX_HOME environment variable so that auth is saved to this app's
+/// directory, not the official codex directory.
 pub fn run_codex_login<F>(on_output: F) -> Result<()>
 where
     F: Fn(String) + Send + Sync,
 {
+    // Get the codex_router home directory to pass to the CLI
+    let codex_home = get_codex_home().context("Failed to get CODEX_HOME")?;
+
     let mut child = Command::new("codex")
         .arg("login")
+        .env("CODEX_HOME", &codex_home)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
