@@ -8,10 +8,7 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const SCOPE: &str = "openid profile email offline_access";
 const AUDIENCE: &str = "https://api.openai.com/v1/"; // Standard OpenAI audience
 
-fn get_auth_domain() -> String {
-    std::env::var("CODEX_ROUTER_AUTH_DOMAIN")
-        .unwrap_or_else(|_| "https://auth.openai.com".to_string())
-}
+// Local get_auth_domain removed in favor of crate::config::get_auth_domain
 
 #[derive(Debug, Deserialize)]
 struct DeviceCodeResponse {
@@ -56,7 +53,7 @@ where
         .build()?;
 
     // 1. Request Device Code
-    let device_code_url = format!("{}/oauth/device/code", get_auth_domain());
+    let device_code_url = format!("{}/oauth/device/code", crate::config::get_auth_domain());
     let params = [
         ("client_id", CLIENT_ID),
         ("scope", SCOPE),
@@ -95,7 +92,7 @@ where
     let _ = open::that(url_to_open);
 
     // 3. Poll for Token
-    let token_url = format!("{}/oauth/token", get_auth_domain());
+    let token_url = format!("{}/oauth/token", crate::config::get_auth_domain());
     let expiry = std::time::Instant::now() + Duration::from_secs(code_res.expires_in);
     let mut interval = Duration::from_secs(code_res.interval);
 

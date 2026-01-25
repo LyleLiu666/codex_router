@@ -67,3 +67,8 @@ pub const DEFAULT_USER_AGENT: &str = "codex-cli";
 pub fn default_user_agent() -> String {
     env::var("CODEX_ROUTER_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string())
 }
+
+/// Get the authentication domain
+pub fn get_auth_domain() -> String {
+    env::var("CODEX_ROUTER_AUTH_DOMAIN").unwrap_or_else(|_| "https://auth.openai.com".to_string())
+}

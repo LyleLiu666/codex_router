@@ -16,7 +16,6 @@ const DEFAULT_CHATGPT_FALLBACK_BASE_URL: &str = "https://chat.openai.com/backend
 const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 
 // OAuth token refresh constants
-const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 /// Quota information
@@ -427,8 +426,10 @@ pub async fn refresh_token(refresh_token: &str) -> Result<RefreshResponse> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
+    let refresh_url = format!("{}/oauth/token", crate::config::get_auth_domain());
+
     let response = client
-        .post(REFRESH_TOKEN_URL)
+        .post(&refresh_url)
         .header("Content-Type", "application/json")
         .json(&request)
         .send()

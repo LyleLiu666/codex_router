@@ -402,7 +402,7 @@ mod tests {
             StringEnvGuard::set("CODEX_ROUTER_AUTH_DOMAIN", format!("http://{auth_addr}"));
 
         let server = thread::spawn(move || {
-            let expected_requests = 3; // 1 auth device code, 1 auth token, 1 quota
+            let expected_requests = 4; // 1 auth device code, 1 auth token, 2 quotas (work + new)
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut handled = 0;
 
@@ -543,8 +543,8 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(
             server.join().unwrap(),
-            2,
-            "expected the quota server to receive both profile requests"
+            4,
+            "expected the quota server to receive both profile and auth requests"
         );
     }
 
