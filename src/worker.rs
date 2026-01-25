@@ -1,6 +1,8 @@
 use std::fs;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::app_state::{AppCommand, AppEvent};
@@ -127,6 +129,7 @@ fn finalize_login(new_auth: auth::AuthDotJson) -> anyhow::Result<()> {
 pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
+        let login_cancel_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
         while let Ok(command) = cmd_rx.recv() {
             match command {
@@ -203,23 +206,26 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                 },
                 AppCommand::RunLogin => {
                     let evt_tx = evt_tx.clone();
+                    let cancel_flag = login_cancel_flag.clone();
+                    cancel_flag.store(false, Ordering::Relaxed); // Reset cancel flag
                     std::thread::spawn(move || {
-                        let runtime =
-                            tokio::runtime::Runtime::new().expect("failed to create runtime");
-
-                        let res = runtime.block_on(async {
-                            oauth::start_login_flow(|code, url| {
-                                let _ = evt_tx.send(AppEvent::LoginOutput {
-                                    output: format!("Please open: {}\nCode: {}\n", url, code),
+                        let evt_tx_clone = evt_tx.clone();
+                        let res = oauth::start_browser_login(
+                            move |status| {
+                                let _ = evt_tx_clone.send(AppEvent::LoginOutput {
+                                    output: status.clone(),
                                     parsed: login_output::LoginOutput {
-                                        url: Some(url),
-                                        code: Some(code),
+                                        url: None,
+                                        code: None,
                                     },
                                     running: true,
                                 });
-                            })
-                            .await
-                        });
+                            },
+                            cancel_flag.clone(),
+                        );
+
+                        let runtime =
+                            tokio::runtime::Runtime::new().expect("failed to create runtime");
 
                         match res {
                             Ok(auth_result) => {
@@ -270,8 +276,8 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                     });
                 }
                 AppCommand::CancelLogin => {
-                    // Cancellation not supported in native flow yet
-                    tracing::warn!("CancelLogin requested but not implemented for native flow");
+                    login_cancel_flag.store(true, Ordering::Relaxed);
+                    tracing::info!("Login cancellation requested");
                 }
                 AppCommand::OpenLoginUrl(url) => {
                     let _ = Command::new("open").arg(url).status();
