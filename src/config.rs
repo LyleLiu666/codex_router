@@ -61,3 +61,9 @@ pub fn get_router_state_file() -> Result<PathBuf> {
     let config_dir = get_router_config_dir()?;
     Ok(config_dir.join("state.json"))
 }
+
+pub const DEFAULT_USER_AGENT: &str = "codex-cli";
+
+pub fn default_user_agent() -> String {
+    env::var("CODEX_ROUTER_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string())
+}

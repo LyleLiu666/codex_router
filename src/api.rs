@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::Duration;
 
-use crate::auth;
+use crate::{auth, config};
 
 const DEFAULT_USAGE_URL: &str = "https://api.openai.com/v1/usage";
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -14,7 +14,6 @@ const CODEX_USAGE_PATH: &str = "/api/codex/usage";
 const CODEX_USAGE_FALLBACK_PATH: &str = "/codex/usage";
 const DEFAULT_CHATGPT_FALLBACK_BASE_URL: &str = "https://chat.openai.com/backend-api";
 const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
-const DEFAULT_USER_AGENT: &str = "codex-cli";
 
 // OAuth token refresh constants
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -177,7 +176,7 @@ async fn fetch_quota_with_client(
             .header("originator", DEFAULT_ORIGINATOR)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, default_user_agent());
+            .header(reqwest::header::USER_AGENT, config::default_user_agent());
     }
 
     let response = request.send().await;
@@ -328,10 +327,6 @@ fn join_url(base: &str, path: &str) -> String {
     format!("{}/{}", base, path)
 }
 
-fn default_user_agent() -> String {
-    env::var("CODEX_ROUTER_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string())
-}
-
 fn should_fallback_on_unauthorized(body: &str) -> bool {
     body.contains("\"invalid_api_key\"") || body.contains("Incorrect API key provided")
 }
@@ -420,14 +415,17 @@ pub struct RefreshResponse {
 
 /// Refresh expired OAuth tokens using the refresh_token grant
 pub async fn refresh_token(refresh_token: &str) -> Result<RefreshResponse> {
-    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-
     let request = RefreshRequest {
         client_id: CLIENT_ID,
         grant_type: "refresh_token",
         refresh_token,
         scope: "openid profile email",
     };
+
+    let client = Client::builder()
+        .user_agent(config::default_user_agent())
+        .timeout(Duration::from_secs(30))
+        .build()?;
 
     let response = client
         .post(REFRESH_TOKEN_URL)

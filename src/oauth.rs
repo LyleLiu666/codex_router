@@ -30,10 +30,12 @@ enum TokenResponse {
         access_token: String,
         refresh_token: String,
         id_token: Option<String>,
+        #[serde(rename = "expires_in")]
         _expires_in: u64,
     },
     Error {
         error: String,
+        #[serde(rename = "error_description")]
         _error_description: Option<String>,
     },
 }
@@ -49,7 +51,9 @@ pub async fn start_login_flow<F>(on_code: F) -> Result<AuthResult>
 where
     F: Fn(String, String) + Send + Sync, // (user_code, verification_uri)
 {
-    let client = Client::new();
+    let client = Client::builder()
+        .user_agent(crate::config::default_user_agent())
+        .build()?;
 
     // 1. Request Device Code
     let device_code_url = format!("{}/oauth/device/code", get_auth_domain());

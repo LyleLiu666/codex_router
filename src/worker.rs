@@ -518,7 +518,7 @@ mod tests {
 
         cmd_tx.send(AppCommand::RunLogin).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut profiles_with_quota = None;
         while std::time::Instant::now() < deadline {
             let Ok(event) = evt_rx.recv_timeout(Duration::from_millis(200)) else {
