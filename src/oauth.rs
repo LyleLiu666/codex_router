@@ -26,8 +26,27 @@ struct UserCodeResp {
     device_auth_id: String,
     #[serde(alias = "user_code", alias = "usercode")]
     user_code: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_interval_string")]
     interval: u64,
+}
+
+fn deserialize_interval_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntervalValue {
+        String(String),
+        U64(u64),
+    }
+
+    match IntervalValue::deserialize(deserializer)? {
+        IntervalValue::String(s) => s
+            .parse::<u64>()
+            .map_err(|e| serde::de::Error::custom(format!("invalid interval string: {}", e))),
+        IntervalValue::U64(v) => Ok(v),
+    }
 }
 
 #[derive(Serialize)]
@@ -81,7 +100,8 @@ async fn request_user_code(client: &Client) -> Result<UserCodeResp> {
     }
 
     let text = resp.text().await?;
-    serde_json::from_str(&text).context("Failed to parse user code response")
+    serde_json::from_str(&text)
+        .with_context(|| format!("Failed to parse user code response: {}", text))
 }
 
 /// Poll token endpoint until user authorizes
