@@ -288,13 +288,19 @@ pub async fn switch_profile(profile_name: &str) -> Result<()> {
     let profile_auth = fs::read_to_string(&profile_auth_file)?;
     let auth: AuthDotJson = serde_json::from_str(&profile_auth)?;
 
-    // Save to main auth.json
+    // Save to our isolated auth.json
     let main_auth_file = get_auth_file()?;
     if let Some(parent) = main_auth_file.parent() {
         fs::create_dir_all(parent)?;
     }
-
     fs::write(&main_auth_file, serde_json::to_string_pretty(&auth)?)?;
+
+    // Also sync to official codex auth.json so `codex` CLI uses this account
+    let official_auth_file = crate::config::get_official_auth_file()?;
+    if let Some(parent) = official_auth_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&official_auth_file, serde_json::to_string_pretty(&auth)?)?;
 
     // Update current profile marker
     save_current_profile(profile_name)?;

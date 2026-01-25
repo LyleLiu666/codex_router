@@ -413,7 +413,7 @@ struct RefreshRequest<'a> {
 
 #[derive(Deserialize)]
 pub struct RefreshResponse {
-    pub id_token: Option<String>,
+    pub _id_token: Option<String>,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
 }

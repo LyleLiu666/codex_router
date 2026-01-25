@@ -29,6 +29,7 @@ tray-icon = "0.21.3"
 image = { version = "0.25", features = ["png"] }
 axum = "0.8.8"
 tower-http = { version = "0.6.8", features = ["cors", "trace"] }
+open = "5.3.3"
 
 [profile.release]
 opt-level = "z"

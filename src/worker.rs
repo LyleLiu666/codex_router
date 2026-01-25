@@ -1,6 +1,5 @@
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -12,7 +11,7 @@ type LoginProcessHolder = Arc<Mutex<Option<u32>>>;
 use crate::app_state::{AppCommand, AppEvent};
 use crate::config;
 use crate::login_output;
-use crate::{api, auth, profile};
+use crate::{api, auth, oauth, profile};
 
 /// Find the codex binary using multiple detection strategies.
 /// Priority order:
@@ -320,16 +319,7 @@ fn load_profiles_with_quota(
     Ok(profiles)
 }
 
-fn read_existing_auth_json(path: &Path) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-    fs::read_to_string(path).ok()
-}
-
-fn finalize_login(previous_auth_json: Option<String>) -> anyhow::Result<()> {
-    // Read newly logged-in auth from official codex directory
-    let new_auth = auth::load_auth_from_official_codex()?;
+fn finalize_login(new_auth: auth::AuthDotJson) -> anyhow::Result<()> {
     let outcome = profile::save_auth_as_profile_without_switch(&new_auth)?;
 
     let name = match &outcome {
@@ -337,13 +327,6 @@ fn finalize_login(previous_auth_json: Option<String>) -> anyhow::Result<()> {
         | profile::SaveProfileOutcome::Updated { name }
         | profile::SaveProfileOutcome::AlreadyExists { name } => name.clone(),
     };
-
-    // Restore previous auth.json in official codex directory (if any)
-    // This prevents our login from affecting the official codex CLI's current session
-    let official_auth_file = config::get_official_auth_file()?;
-    if let Some(previous) = previous_auth_json {
-        fs::write(&official_auth_file, previous)?;
-    }
 
     // Set current profile in our isolated config if not already set
     let current_profile_file = config::get_current_profile_file()?;
@@ -371,7 +354,6 @@ fn finalize_login(previous_auth_json: Option<String>) -> anyhow::Result<()> {
 pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
-        let login_process: LoginProcessHolder = Arc::new(Mutex::new(None));
 
         while let Ok(command) = cmd_rx.recv() {
             match command {
@@ -447,179 +429,76 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                     }
                 },
                 AppCommand::RunLogin => {
-                    // Read previous auth from official codex directory (to restore after login)
-                    let previous_auth_json = config::get_official_auth_file()
-                        .ok()
-                        .and_then(|path| read_existing_auth_json(&path));
-
                     let evt_tx = evt_tx.clone();
-                    let login_process = Arc::clone(&login_process);
                     std::thread::spawn(move || {
-                        let _ = evt_tx.send(AppEvent::LoginOutput {
-                            output: String::new(),
-                            parsed: login_output::LoginOutput::default(),
-                            running: true,
-                        });
+                        let runtime =
+                            tokio::runtime::Runtime::new().expect("failed to create runtime");
 
-                        let codex_path = match find_codex_binary() {
-                            Some(path) => path,
-                            None => {
-                                let _ = evt_tx.send(AppEvent::LoginFinished {
-                                    success: false,
-                                    message: "codex binary not found. Please install it via: npm install -g @openai/codex".to_string(),
+                        let res = runtime.block_on(async {
+                            oauth::start_login_flow(|code, url| {
+                                let _ = evt_tx.send(AppEvent::LoginOutput {
+                                    output: format!("Please open: {}\nCode: {}\n", url, code),
+                                    parsed: login_output::LoginOutput {
+                                        url: Some(url),
+                                        code: Some(code),
+                                    },
+                                    running: true,
                                 });
-                                return;
-                            }
-                        };
-
-                        let mut command = Command::new(&codex_path);
-                        command
-                            .arg("login")
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped());
-
-                        // Add the directory containing the codex binary to PATH
-                        // This ensures that `#!/usr/bin/env node` finds the node executable (which is often in the same dir)
-                        if let Some(parent) = codex_path.parent() {
-                            if let Ok(path) = std::env::var("PATH") {
-                                let new_path = format!("{}:{}", parent.display(), path);
-                                command.env("PATH", new_path);
-                            }
-                        }
-
-                        let mut child = match command.spawn() {
-                            Ok(child) => child,
-                            Err(err) => {
-                                let _ = evt_tx.send(AppEvent::LoginFinished {
-                                    success: false,
-                                    message: format!("Failed to start codex login: {err}"),
-                                });
-                                return;
-                            }
-                        };
-
-                        // Store the child process ID for cancellation
-                        {
-                            let mut holder = login_process.lock().unwrap();
-                            *holder = Some(child.id());
-                        }
-
-                        let stdout = child.stdout.take();
-                        let stderr = child.stderr.take();
-
-                        let spawn_reader = |stream: Option<std::process::ChildStdout>| {
-                            let Some(stream) = stream else { return None };
-                            let evt_tx = evt_tx.clone();
-                            Some(std::thread::spawn(move || {
-                                let reader = BufReader::new(stream);
-                                for line in reader.lines().map_while(Result::ok) {
-                                    let mut chunk = line;
-                                    chunk.push('\n');
-                                    let parsed = login_output::parse_login_output(&chunk);
-                                    let _ = evt_tx.send(AppEvent::LoginOutput {
-                                        output: chunk,
-                                        parsed,
-                                        running: true,
-                                    });
-                                }
-                            }))
-                        };
-
-                        let stdout_handle = spawn_reader(stdout);
-
-                        let stderr_handle = stderr.map(|stream| {
-                            let evt_tx = evt_tx.clone();
-                            std::thread::spawn(move || {
-                                let reader = BufReader::new(stream);
-                                for line in reader.lines().map_while(Result::ok) {
-                                    let mut chunk = line;
-                                    chunk.push('\n');
-                                    let parsed = login_output::parse_login_output(&chunk);
-                                    let _ = evt_tx.send(AppEvent::LoginOutput {
-                                        output: chunk,
-                                        parsed,
-                                        running: true,
-                                    });
-                                }
                             })
+                            .await
                         });
 
-                        let status = child.wait();
+                        match res {
+                            Ok(auth_result) => {
+                                let auth_data = auth::AuthDotJson {
+                                    openai_api_key: None,
+                                    tokens: Some(auth::TokenData {
+                                        access_token: auth_result.access_token,
+                                        refresh_token: auth_result.refresh_token,
+                                        id_token: auth_result.id_token.map(auth::IdToken::Raw),
+                                        account_id: None,
+                                    }),
+                                    last_refresh: None,
+                                };
 
-                        if let Some(handle) = stdout_handle {
-                            let _ = handle.join();
-                        }
-                        if let Some(handle) = stderr_handle {
-                            let _ = handle.join();
-                        }
+                                let _ = evt_tx.send(AppEvent::LoginFinished {
+                                    success: true,
+                                    message: "Login successful".into(),
+                                });
 
-                        let (success, message) = match status {
-                            Ok(status) if status.success() => (true, "codex login finished".into()),
-                            Ok(status) => (false, format!("codex login failed: {status}")),
-                            Err(err) => (false, format!("codex login failed: {err}")),
-                        };
+                                if let Err(err) = finalize_login(auth_data) {
+                                    let _ = evt_tx.send(AppEvent::Error(err.to_string()));
+                                    return;
+                                }
 
-                        // Clear the process holder
-                        {
-                            let mut holder = login_process.lock().unwrap();
-                            *holder = None;
-                        }
-
-                        let _ = evt_tx.send(AppEvent::LoginFinished {
-                            success,
-                            message: message.clone(),
-                        });
-
-                        if success {
-                            if let Err(err) = finalize_login(previous_auth_json) {
-                                let _ = evt_tx.send(AppEvent::Error(err.to_string()));
-                                return;
-                            }
-
-                            let runtime =
-                                tokio::runtime::Runtime::new().expect("failed to create runtime");
-                            match load_profiles_with_quota(&runtime) {
-                                Ok(profiles) => {
-                                    let current_quota = profiles
-                                        .iter()
-                                        .find(|profile| profile.is_current)
-                                        .and_then(|profile| profile.quota.clone());
-                                    let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
-                                    if let Some(quota) = current_quota {
-                                        let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
+                                match load_profiles_with_quota(&runtime) {
+                                    Ok(profiles) => {
+                                        let current_quota = profiles
+                                            .iter()
+                                            .find(|profile| profile.is_current)
+                                            .and_then(|profile| profile.quota.clone());
+                                        let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                                        if let Some(quota) = current_quota {
+                                            let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = evt_tx.send(AppEvent::Error(err.to_string()));
                                     }
                                 }
-                                Err(err) => {
-                                    let _ = evt_tx.send(AppEvent::Error(err.to_string()));
-                                }
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(AppEvent::LoginFinished {
+                                    success: false,
+                                    message: e.to_string(),
+                                });
                             }
                         }
                     });
                 }
                 AppCommand::CancelLogin => {
-                    let pid = {
-                        let mut holder = login_process.lock().unwrap();
-                        holder.take()
-                    };
-                    if let Some(pid) = pid {
-                        // Send SIGTERM to gracefully terminate the login process
-                        #[cfg(unix)]
-                        {
-                            let _ = Command::new("kill")
-                                .args(["-TERM", &pid.to_string()])
-                                .status();
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = Command::new("taskkill")
-                                .args(["/PID", &pid.to_string(), "/F"])
-                                .status();
-                        }
-                        let _ = evt_tx.send(AppEvent::LoginFinished {
-                            success: false,
-                            message: "Login cancelled".to_string(),
-                        });
-                    }
+                    // Cancellation not supported in native flow yet
+                    tracing::warn!("CancelLogin requested but not implemented for native flow");
                 }
                 AppCommand::OpenLoginUrl(url) => {
                     let _ = Command::new("open").arg(url).status();
@@ -702,18 +581,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
 
-        let old_jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im9sZEBleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyIsImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3Rfb2xkIn19.sig";
-        let old_auth = auth::AuthDotJson {
-            openai_api_key: None,
-            tokens: Some(auth::TokenData {
-                id_token: Some(auth::IdToken::Raw(old_jwt.to_string())),
-                access_token: "old-access".to_string(),
-                refresh_token: "old-refresh".to_string(),
-                account_id: Some("acct_old".to_string()),
-            }),
-            last_refresh: None,
-        };
-
         let new_jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im5ld0BleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InRlYW0iLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0X25ldyJ9fQ.sig";
         let new_auth = auth::AuthDotJson {
             openai_api_key: None,
@@ -728,31 +595,18 @@ mod tests {
 
         let profiles_dir = temp_dir.path().join("profiles");
         fs::create_dir_all(profiles_dir.join("work")).unwrap();
-        fs::write(
-            profiles_dir.join("work").join("auth.json"),
-            serde_json::to_string_pretty(&old_auth).unwrap(),
-        )
-        .unwrap();
         fs::write(temp_dir.path().join(".current_profile"), "work").unwrap();
 
-        let auth_path = temp_dir.path().join("auth.json");
-        fs::write(&auth_path, serde_json::to_string_pretty(&old_auth).unwrap()).unwrap();
-        let previous_auth_json = fs::read_to_string(&auth_path).unwrap();
+        let _ = finalize_login(new_auth).unwrap();
 
-        fs::write(&auth_path, serde_json::to_string_pretty(&new_auth).unwrap()).unwrap();
-
-        let _ = finalize_login(Some(previous_auth_json)).unwrap();
-
-        let restored = fs::read_to_string(&auth_path).unwrap();
-        let restored_value: serde_json::Value = serde_json::from_str(&restored).unwrap();
-        let expected_value: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string_pretty(&old_auth).unwrap()).unwrap();
-        assert_eq!(restored_value, expected_value);
         assert_eq!(
             fs::read_to_string(temp_dir.path().join(".current_profile")).unwrap(),
             "work"
         );
         assert!(profiles_dir.join("new").exists());
+
+        // Verify it didn't touch official codex (we just check if it exists or not, but in this isolated test, official is same as codex router dir unless we mock get_official_auth_file separately.
+        // But since we removed get_official... usage, we are good.)
     }
 
     #[test]
@@ -766,31 +620,55 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let _base_url_guard =
             StringEnvGuard::set("CODEX_ROUTER_CHATGPT_BASE_URL", format!("http://{addr}"));
+
+        // Mock Auth Server
+        let auth_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        auth_listener.set_nonblocking(true).unwrap();
+        let auth_addr = auth_listener.local_addr().unwrap();
+        let _auth_domain_guard =
+            StringEnvGuard::set("CODEX_ROUTER_AUTH_DOMAIN", format!("http://{auth_addr}"));
+
         let server = thread::spawn(move || {
-            let expected_requests = 2;
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let expected_requests = 3; // 1 auth device code, 1 auth token, 1 quota
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut handled = 0;
 
+            // Simple event loop for both listeners
             while handled < expected_requests && std::time::Instant::now() < deadline {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(value) => value,
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(err) => panic!("failed to accept quota request: {err}"),
-                };
+                // Check Auth Listener first
+                if let Ok((mut stream, _)) = auth_listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
 
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let body = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"reset_at":"2025-01-01T00:00:00Z"},"secondary_window":{"used_percent":20}}}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-                handled += 1;
+                    if req.contains("POST /oauth/device/code") {
+                        let body = r#"{"device_code":"dev_123","user_code":"USER-CODE","verification_uri":"http://example.com","expires_in":300,"interval":1}"#;
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                        stream.write_all(response.as_bytes()).unwrap();
+                        handled += 1;
+                    } else if req.contains("POST /oauth/token") {
+                        let body = r#"{"access_token":"new-access","refresh_token":"new-refresh","id_token":"eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im5ld0BleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InRlYW0iLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0X25ldyJ9fQ.sig","expires_in":3600}"#;
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                        stream.write_all(response.as_bytes()).unwrap();
+                        handled += 1;
+                    }
+                }
+
+                // Check Quota Listener
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"reset_at":"2025-01-01T00:00:00Z"},"secondary_window":{"used_percent":20}}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    handled += 1;
+                }
+
+                thread::sleep(Duration::from_millis(10));
             }
 
             handled

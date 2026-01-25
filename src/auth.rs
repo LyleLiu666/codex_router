@@ -84,23 +84,6 @@ pub fn load_auth() -> Result<AuthDotJson> {
     Ok(auth)
 }
 
-/// Load auth from the official Codex CLI auth.json file (for migration)
-pub fn load_auth_from_official_codex() -> Result<AuthDotJson> {
-    let auth_file = crate::config::get_official_auth_file()?;
-
-    if !auth_file.exists() {
-        anyhow::bail!("Official codex auth not found. Please run 'codex login' first.");
-    }
-
-    let content = fs::read_to_string(&auth_file)
-        .with_context(|| format!("Failed to read official auth file: {:?}", auth_file))?;
-
-    let auth: AuthDotJson =
-        serde_json::from_str(&content).with_context(|| "Failed to parse official auth.json")?;
-
-    Ok(auth)
-}
-
 /// Save auth to the active auth.json file
 #[allow(dead_code)]
 pub fn save_auth(auth: &AuthDotJson) -> Result<()> {

@@ -17,7 +17,7 @@ pub fn get_codex_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".codex_router"))
 }
 
-/// Get the official Codex CLI home directory (for migration)
+/// Get the official Codex CLI home directory (for migration and sync)
 pub fn get_official_codex_home() -> Result<PathBuf> {
     let home = env::var("HOME")
         .or_else(|_| env::var("USERPROFILE"))
@@ -26,7 +26,7 @@ pub fn get_official_codex_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".codex"))
 }
 
-/// Get the official Codex CLI auth file (for migration)
+/// Get the official Codex CLI auth file (for migration and sync)
 pub fn get_official_auth_file() -> Result<PathBuf> {
     let codex_home = get_official_codex_home()?;
     Ok(codex_home.join("auth.json"))
