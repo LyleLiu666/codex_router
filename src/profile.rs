@@ -272,6 +272,57 @@ mod tests {
             serde_json::from_str(&serde_json::to_string_pretty(&new_auth).unwrap()).unwrap();
         assert_eq!(updated_value, expected_value);
     }
+
+    #[test]
+    fn switch_profile_populates_missing_account_id() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+        let _home_guard = EnvGuard::set("HOME", temp_dir.path());
+
+        let jwt = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8iLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0XzEyMyJ9fQ.sig";
+        let profile_auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: Some(IdToken::Raw(jwt.to_string())),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: None,
+            }),
+            last_refresh: None,
+        };
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("alpha")).unwrap();
+        fs::write(
+            profiles_dir.join("alpha").join("auth.json"),
+            serde_json::to_string_pretty(&profile_auth).unwrap(),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(switch_profile("alpha")).unwrap();
+
+        let isolated = fs::read_to_string(temp_dir.path().join("auth.json")).unwrap();
+        let isolated_auth: AuthDotJson = serde_json::from_str(&isolated).unwrap();
+        assert_eq!(
+            isolated_auth
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.account_id.as_deref()),
+            Some("acct_123")
+        );
+
+        let official = fs::read_to_string(temp_dir.path().join(".codex").join("auth.json")).unwrap();
+        let official_auth: AuthDotJson = serde_json::from_str(&official).unwrap();
+        assert_eq!(
+            official_auth
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.account_id.as_deref()),
+            Some("acct_123")
+        );
+    }
 }
 
 /// Switch to a profile
@@ -286,7 +337,18 @@ pub async fn switch_profile(profile_name: &str) -> Result<()> {
 
     // Read profile auth
     let profile_auth = fs::read_to_string(&profile_auth_file)?;
-    let auth: AuthDotJson = serde_json::from_str(&profile_auth)?;
+    let mut auth: AuthDotJson = serde_json::from_str(&profile_auth)?;
+    if auth
+        .tokens
+        .as_ref()
+        .is_some_and(|tokens| tokens.account_id.is_none())
+    {
+        if let Some(account_id) = auth::get_account_id(&auth) {
+            if let Some(tokens) = auth.tokens.as_mut() {
+                tokens.account_id = Some(account_id);
+            }
+        }
+    }
 
     // Save to our isolated auth.json
     let main_auth_file = get_auth_file()?;
