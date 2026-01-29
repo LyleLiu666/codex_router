@@ -305,10 +305,17 @@ impl eframe::App for RouterApp {
                                     }
                                     if profile.is_current {
                                         ui.add_enabled(false, egui::Button::new("Current"));
-                                    } else if ui.button("Switch").clicked() {
-                                        let _ = self
-                                            .cmd_tx
-                                            .send(AppCommand::SwitchProfile(profile.name.clone()));
+                                    } else {
+                                        if ui.button("Switch").clicked() {
+                                            let _ = self.cmd_tx.send(AppCommand::SwitchProfile(
+                                                profile.name.clone(),
+                                            ));
+                                        }
+                                        if ui.button("Delete").clicked() {
+                                            let _ = self.cmd_tx.send(AppCommand::DeleteProfile(
+                                                profile.name.clone(),
+                                            ));
+                                        }
                                     }
                                 },
                             );

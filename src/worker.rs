@@ -690,4 +690,36 @@ mod tests {
 
         server_thread.join().unwrap();
     }
+    #[test]
+    fn test_delete_profile_removes_profile() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("to_delete")).unwrap();
+        fs::write(profiles_dir.join("to_delete").join("auth.json"), "{}").unwrap();
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let handle = start_worker(cmd_rx, evt_tx);
+
+        cmd_tx
+            .send(AppCommand::DeleteProfile("to_delete".to_string()))
+            .unwrap();
+
+        // Expect ProfilesLoaded event
+        let event = evt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match event {
+            AppEvent::ProfilesLoaded(profiles) => {
+                assert!(profiles.is_empty());
+            }
+            _ => panic!("unexpected event"),
+        }
+
+        assert!(!profiles_dir.join("to_delete").exists());
+
+        cmd_tx.send(AppCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
 }
