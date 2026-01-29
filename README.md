@@ -45,11 +45,40 @@ cargo run
 - Use the tray menu to switch profiles quickly.
 - Use "Refresh Profiles" to rescan `~/.codex/profiles`.
 
+## API Usage Example (Python)
+
+The router exposes an OpenAI-compatible endpoint at `http://localhost:9876/v1`. You can use the standard `openai` Python library:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:9876/v1",
+    api_key="unused"  # API key is managed by the router's active profile
+)
+
+response = client.chat.completions.create(
+    model="gpt-5.2-codex",
+    messages=[
+        {"role": "user", "content": "Hello, how are you?"}
+    ],
+    stream=True,
+    # Optional: Codex-specific parameters
+    extra_body={
+        "reasoning_effort": "medium" 
+    }
+)
+
+for chunk in response:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+```
+
 ## Development
 
 Project structure:
 
-```
+```text
 codex_router/
 ├── Cargo.toml
 ├── README.md
