@@ -108,10 +108,14 @@ async fn handle_chat_completions(
         // Actually, the user requirement mentions `gpt-5.2-codex` etc. which implies it might proxy to Codex backend or OpenAI.
         // If it's Codex backend, we need `ChatGPT-Account-Id`.
 
-        let url = "https://api.openai.com/v1/chat/completions";
+        let base_url = std::env::var("CODEX_ROUTER_CHATGPT_BASE_URL")
+            .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string());
+        // Try the fallback-style path first as it seems more likely common
+        let url = format!("{}/codex/response", base_url.trim_end_matches('/'));
+        tracing::info!("Using upstream URL: {}", url);
 
         let mut req = client
-            .post(url)
+            .post(&url)
             .header("Authorization", format!("Bearer {}", access_token))
             .json(&body_json);
 
