@@ -35,6 +35,8 @@ impl RouterApp {
         let tray_handle = if cfg!(test) {
             None
         } else {
+            let tx = tray_tx.clone();
+            crate::dock::start_dock_observer(tx);
             Some(tray::start_tray(tray_tx))
         };
 

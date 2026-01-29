@@ -3,6 +3,7 @@ mod app;
 mod app_state;
 mod auth;
 mod config;
+mod dock;
 mod icon;
 mod login_output;
 mod oauth;
