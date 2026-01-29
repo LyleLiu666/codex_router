@@ -204,9 +204,11 @@ impl eframe::App for RouterApp {
                 let next_profile = self.state.current_profile.clone();
                 if should_fetch_on_profile_change(prev_profile.as_deref(), next_profile.as_deref())
                 {
-                    self.router_state.last_selected_profile = next_profile;
+                    self.router_state.last_selected_profile = next_profile.clone();
                     self.persist_router_state();
-                    let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+                    if let Some(name) = next_profile {
+                        let _ = self.cmd_tx.send(AppCommand::FetchProfileQuota(name));
+                    }
                 }
             }
         }

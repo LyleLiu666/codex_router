@@ -186,15 +186,109 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                     };
                 }
                 AppCommand::FetchProfileQuota(name) => match profile::load_profile_auth(&name) {
-                    Ok(auth) => match runtime.block_on(api::fetch_quota(&auth)) {
+                    Ok(mut auth) => match runtime.block_on(api::fetch_quota(&auth)) {
                         Ok(quota) => {
                             let _ = evt_tx.send(AppEvent::ProfileQuotaLoaded { name, quota });
                         }
                         Err(err) => {
-                            let _ = evt_tx.send(AppEvent::Error(format!(
-                                "Failed to fetch quota for {}: {}",
-                                name, err
-                            )));
+                            if let Some(api::AuthError::Expired) =
+                                err.downcast_ref::<api::AuthError>()
+                            {
+                                if let Some(ref tokens) = auth.tokens {
+                                    tracing::info!(
+                                        profile = %name,
+                                        "Access token expired, attempting refresh"
+                                    );
+                                    match runtime.block_on(api::refresh_token(&tokens.refresh_token))
+                                    {
+                                        Ok(refresh_response) => {
+                                            // Update auth with new tokens
+                                            if let Some(ref mut tokens) = auth.tokens {
+                                                if let Some(new_access) = refresh_response.access_token {
+                                                    tokens.access_token = new_access;
+                                                }
+                                                if let Some(new_refresh) = refresh_response.refresh_token
+                                                {
+                                                    tokens.refresh_token = new_refresh;
+                                                }
+                                                // Note: id_token update requires parsing, skip for now
+                                            }
+                                            auth.last_refresh = Some(chrono::Utc::now());
+
+                                            // Save updated auth to profile
+                                            if let Err(save_err) =
+                                                profile::save_profile_auth(&name, &auth)
+                                            {
+                                                tracing::warn!(
+                                                    profile = %name,
+                                                    error = %save_err,
+                                                    "Failed to save refreshed tokens"
+                                                );
+                                            }
+
+                                            // Retry quota fetch with new tokens
+                                            match runtime.block_on(api::fetch_quota(&auth)) {
+                                                Ok(quota) => {
+                                                    let _ = evt_tx.send(AppEvent::ProfileQuotaLoaded {
+                                                        name,
+                                                        quota,
+                                                    });
+                                                }
+                                                Err(retry_err) => {
+                                                    tracing::warn!(
+                                                        profile = %name,
+                                                        error = %retry_err,
+                                                        "Quota fetch failed after token refresh"
+                                                    );
+                                                    if let Ok(mut profiles) =
+                                                        profile::list_profiles_data()
+                                                    {
+                                                        if let Some(profile) = profiles
+                                                            .iter_mut()
+                                                            .find(|p| p.name == name)
+                                                        {
+                                                            profile.is_valid = false;
+                                                            profile.quota = None;
+                                                        }
+                                                        let _ = evt_tx.send(AppEvent::ProfilesLoaded(
+                                                            profiles,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(refresh_err) => {
+                                            tracing::warn!(
+                                                profile = %name,
+                                                error = %refresh_err,
+                                                "Token refresh failed"
+                                            );
+                                            if let Ok(mut profiles) = profile::list_profiles_data() {
+                                                if let Some(profile) =
+                                                    profiles.iter_mut().find(|p| p.name == name)
+                                                {
+                                                    profile.is_valid = false;
+                                                    profile.quota = None;
+                                                }
+                                                let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                                            }
+                                        }
+                                    }
+                                } else if let Ok(mut profiles) = profile::list_profiles_data() {
+                                    if let Some(profile) =
+                                        profiles.iter_mut().find(|p| p.name == name)
+                                    {
+                                        profile.is_valid = false;
+                                        profile.quota = None;
+                                    }
+                                    let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                                }
+                            } else {
+                                let _ = evt_tx.send(AppEvent::Error(format!(
+                                    "Failed to fetch quota for {}: {}",
+                                    name, err
+                                )));
+                            }
                         }
                     },
                     Err(err) => {
@@ -250,16 +344,30 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                     return;
                                 }
 
-                                match load_profiles_with_quota(&runtime) {
-                                    Ok(profiles) => {
-                                        let current_quota = profiles
-                                            .iter()
-                                            .find(|profile| profile.is_current)
-                                            .and_then(|profile| profile.quota.clone());
-                                        let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
-                                        if let Some(quota) = current_quota {
-                                            let _ = evt_tx.send(AppEvent::QuotaLoaded(quota));
+                                match profile::list_profiles_data() {
+                                    Ok(mut profiles) => {
+                                        // Find the current profile (which is the one we just logged in as)
+                                        if let Some(current_profile) =
+                                            profiles.iter_mut().find(|p| p.is_current)
+                                        {
+                                            // Load auth for this profile
+                                            if let Ok(auth) =
+                                                profile::load_profile_auth(&current_profile.name)
+                                            {
+                                                // Fetch quota only for this profile
+                                                match runtime.block_on(api::fetch_quota(&auth)) {
+                                                    Ok(quota) => {
+                                                        current_profile.quota = Some(quota.clone());
+                                                        let _ = evt_tx
+                                                            .send(AppEvent::QuotaLoaded(quota));
+                                                    }
+                                                    Err(err) => {
+                                                        tracing::warn!("Failed to fetch quota for new profile: {}", err);
+                                                    }
+                                                }
+                                            }
                                         }
+                                        let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                                     }
                                     Err(err) => {
                                         let _ = evt_tx.send(AppEvent::Error(err.to_string()));
@@ -635,6 +743,117 @@ mod tests {
         cmd_tx.send(AppCommand::Shutdown).unwrap();
         handle.join().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_profile_quota_marks_profile_invalid_when_token_expired() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let quota_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        quota_listener.set_nonblocking(true).unwrap();
+        let quota_addr = quota_listener.local_addr().unwrap();
+        let _base_url_guard =
+            StringEnvGuard::set("CODEX_ROUTER_CHATGPT_BASE_URL", format!("http://{quota_addr}"));
+        let quota_server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut handled = 0;
+            while handled < 2 && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match quota_listener.accept() {
+                    Ok(v) => v,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("accept failed: {}", e),
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "Unauthorized";
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                handled += 1;
+            }
+            handled
+        });
+
+        let auth_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        auth_listener.set_nonblocking(true).unwrap();
+        let auth_addr = auth_listener.local_addr().unwrap();
+        let _auth_domain_guard =
+            StringEnvGuard::set("CODEX_ROUTER_AUTH_DOMAIN", format!("http://{auth_addr}"));
+        let auth_server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                if std::time::Instant::now() > deadline {
+                    panic!("timed out waiting for auth refresh request");
+                }
+                match auth_listener.accept() {
+                    Ok(v) => break v,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("accept failed: {}", e),
+                }
+            };
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "Unauthorized";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let profiles_dir = temp_dir.path().join("profiles");
+        fs::create_dir_all(profiles_dir.join("expired")).unwrap();
+        let auth = auth::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(auth::TokenData {
+                id_token: None,
+                access_token: "expired-token".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct_123".to_string()),
+            }),
+            last_refresh: None,
+        };
+        fs::write(
+            profiles_dir.join("expired").join("auth.json"),
+            serde_json::to_string_pretty(&auth).unwrap(),
+        )
+        .unwrap();
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let handle = start_worker(cmd_rx, evt_tx);
+
+        cmd_tx
+            .send(AppCommand::FetchProfileQuota("expired".to_string()))
+            .unwrap();
+
+        let event = evt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        match event {
+            AppEvent::ProfilesLoaded(profiles) => {
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(profiles[0].name, "expired");
+                assert!(!profiles[0].is_valid);
+                assert!(profiles[0].quota.is_none());
+            }
+            _ => panic!("unexpected event: {:?}", event),
+        }
+
+        cmd_tx.send(AppCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+        quota_server.join().unwrap();
+        auth_server.join().unwrap();
     }
 
     #[test]

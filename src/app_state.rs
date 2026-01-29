@@ -80,7 +80,17 @@ impl Default for AppState {
 impl AppState {
     pub fn apply_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::ProfilesLoaded(profiles) => {
+            AppEvent::ProfilesLoaded(mut profiles) => {
+                // Merge with existing profiles to preserve quota if available for valid profiles.
+                for new_profile in &mut profiles {
+                    if new_profile.is_valid && new_profile.quota.is_none() {
+                        if let Some(existing) =
+                            self.profiles.iter().find(|p| p.name == new_profile.name)
+                        {
+                            new_profile.quota = existing.quota.clone();
+                        }
+                    }
+                }
                 self.current_profile = profiles
                     .iter()
                     .find(|profile| profile.is_current)
@@ -200,5 +210,61 @@ mod tests {
         let mut state = AppState::default();
         state.profile_name_input = "work".to_string();
         assert_eq!(state.profile_name_input, "work");
+    }
+
+    #[test]
+    fn applies_profiles_loaded_event_merges_quota() {
+        let mut state = AppState::default();
+        let mut old_profile = sample_profile();
+        old_profile.quota = Some(QuotaInfo {
+            account_id: "acct_123".to_string(),
+            email: "test@example.com".to_string(),
+            plan_type: "pro".to_string(),
+            used_requests: Some(10),
+            total_requests: Some(100),
+            used_tokens: None,
+            total_tokens: None,
+            reset_date: None,
+            secondary_reset_date: None,
+        });
+        state.profiles = vec![old_profile.clone()];
+
+        let mut new_profile = sample_profile();
+        new_profile.quota = None; // clear quota in new list
+
+        state.apply_event(AppEvent::ProfilesLoaded(vec![new_profile]));
+
+        assert_eq!(state.profiles.len(), 1);
+        // Quota should be preserved
+        assert!(state.profiles[0].quota.is_some());
+        assert_eq!(state.profiles[0].quota, old_profile.quota);
+    }
+
+    #[test]
+    fn applies_profiles_loaded_event_does_not_merge_quota_for_invalid_profile() {
+        let mut state = AppState::default();
+        let mut old_profile = sample_profile();
+        old_profile.quota = Some(QuotaInfo {
+            account_id: "acct_123".to_string(),
+            email: "test@example.com".to_string(),
+            plan_type: "pro".to_string(),
+            used_requests: Some(10),
+            total_requests: Some(100),
+            used_tokens: None,
+            total_tokens: None,
+            reset_date: None,
+            secondary_reset_date: None,
+        });
+        state.profiles = vec![old_profile];
+
+        let mut new_profile = sample_profile();
+        new_profile.is_valid = false;
+        new_profile.quota = None;
+
+        state.apply_event(AppEvent::ProfilesLoaded(vec![new_profile]));
+
+        assert_eq!(state.profiles.len(), 1);
+        assert!(!state.profiles[0].is_valid);
+        assert!(state.profiles[0].quota.is_none());
     }
 }
