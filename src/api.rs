@@ -455,9 +455,33 @@ pub async fn refresh_token(refresh_token: &str) -> Result<RefreshResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    struct StringEnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl StringEnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for StringEnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn auth_stub() -> auth::AuthDotJson {
         auth::AuthDotJson {
@@ -598,6 +622,21 @@ mod tests {
         assert_eq!(quota.reset_date.as_deref(), Some("2026-01-13T00:00:00Z"));
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn codex_usage_urls_prefers_non_api_path_first() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = StringEnvGuard::unset("CODEX_ROUTER_CHATGPT_BASE_URL");
+
+        let urls = codex_usage_urls();
+
+        assert_eq!(urls[0], "https://chatgpt.com/backend-api/codex/usage");
+        assert_eq!(urls[1], "https://chatgpt.com/backend-api/api/codex/usage");
+        assert!(urls.contains(&"https://chat.openai.com/backend-api/codex/usage".to_string()));
+        assert!(urls.contains(
+            &"https://chat.openai.com/backend-api/api/codex/usage".to_string()
+        ));
     }
 
     #[tokio::test]

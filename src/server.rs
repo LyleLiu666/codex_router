@@ -69,18 +69,70 @@ async fn handle_chat_completions(
             .into_response();
     }
 
-    // 3. Try Candidates
-    let client = reqwest::Client::new();
+    // 3. Prepare Request for Upstream
+    // Extract instructions and input from messages
+    let mut instructions: Option<String> = None;
+    let mut input_items: Vec<serde_json::Value> = Vec::new();
 
-    // Reconstruct body
-    let body_json = serde_json::to_value(&payload).unwrap();
-    // Flatten extra fields back if needed, but serde already handled it in struct via flattened `extra`.
-    // Actually, `serde_json::to_value` on `ChatRequest` will produce the correct structure including flattened extra.
+    for msg in payload.messages.into_iter() {
+        if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+            if role == "system" {
+                instructions = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string());
+            } else {
+                input_items.push(msg);
+            }
+        }
+    }
+
+    // Construct the new request body for the /codex/responses endpoint
+    use crate::codex_types::{ContentPart, Reasoning, ResponseItem, ResponsesApiRequest};
+
+    let responses_req = ResponsesApiRequest {
+        model: payload.model.clone(),
+        instructions: instructions.unwrap_or_default(),
+        input: input_items
+            .into_iter()
+            .map(|v| {
+                let role = v
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("user")
+                    .to_string();
+                let content_str = v
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                ResponseItem::Message {
+                    id: Some(format!("msg_{}", uuid::Uuid::new_v4().simple())),
+                    role,
+                    content: vec![ContentPart::Text { text: content_str }],
+                }
+            })
+            .collect(),
+        tools: vec![],
+        tool_choice: "auto".to_string(),
+        parallel_tool_calls: false,
+        reasoning: payload.reasoning_effort.map(|effort| Reasoning { effort }),
+        store: false,
+        stream: true,
+        include: vec![],
+        prompt_cache_key: None,
+        text: None,
+    };
+
+    let body_json = serde_json::to_value(&responses_req).unwrap();
+    tracing::info!("Sending payload: {}", body_json);
+
+    // 4. Try Candidates
+    let client = reqwest::Client::new();
 
     for profile in candidates {
         tracing::info!("Trying profile: {}", profile.name);
 
-        // Load auth
         let auth = match crate::profile::load_profile_auth(&profile.name) {
             Ok(a) => a,
             Err(e) => {
@@ -89,7 +141,6 @@ async fn handle_chat_completions(
             }
         };
 
-        // Determine token and headers
         let access_token = match auth.tokens.as_ref().map(|t| t.access_token.clone()) {
             Some(t) => t,
             None => {
@@ -101,22 +152,17 @@ async fn handle_chat_completions(
             }
         };
 
-        // TODO: This URL logic is simplified. Real logic might need to respect CODEX_ROUTER_CHATGPT_BASE_URL.
-        // Assuming typical OpenAI compatible endpoint for now, or the one from api.rs constants.
-        // api.rs has `DEFAULT_CHATGPT_BASE_URL`.
-        // Let's use `https://api.openai.com/v1/chat/completions` as default fallback or check env.
-        // Actually, the user requirement mentions `gpt-5.2-codex` etc. which implies it might proxy to Codex backend or OpenAI.
-        // If it's Codex backend, we need `ChatGPT-Account-Id`.
-
         let base_url = std::env::var("CODEX_ROUTER_CHATGPT_BASE_URL")
             .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string());
-        // Try the fallback-style path first as it seems more likely common
-        let url = format!("{}/codex/response", base_url.trim_end_matches('/'));
+
+        let url = format!("{}/codex/responses", base_url.trim_end_matches('/'));
         tracing::info!("Using upstream URL: {}", url);
 
         let mut req = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", access_token))
+            .header("originator", "codex_cli_rs")
+            .header("User-Agent", "codex-cli")
             .json(&body_json);
 
         if let Some(account_id) = auth::get_account_id(&auth) {
@@ -126,7 +172,6 @@ async fn handle_chat_completions(
         match req.send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    // Success! Stream response back.
                     let status = resp.status();
                     let headers = resp.headers().clone();
                     let body = axum::body::Body::from_stream(resp.bytes_stream());
@@ -136,23 +181,14 @@ async fn handle_chat_completions(
                         builder = builder.header(key, value);
                     }
                     return builder.body(body).unwrap_or_default();
-                } else if resp.status() == 429 {
-                    tracing::warn!("Profile {} rate limited (429), trying next", profile.name);
-                    continue;
-                } else if resp.status() == 401 || resp.status() == 403 {
-                    tracing::warn!(
-                        "Profile {} auth error ({}), trying next",
-                        profile.name,
-                        resp.status()
-                    );
-                    continue;
                 } else {
-                    // Other errors (500 etc), maybe temporary, or fatal?
-                    // Let's assume we try next for robustness.
+                    let status = resp.status();
+                    let error_text = resp.text().await.unwrap_or_default();
                     tracing::warn!(
-                        "Profile {} error {}, trying next",
+                        "Profile {} error {}, body: {}, trying next",
                         profile.name,
-                        resp.status()
+                        status,
+                        error_text
                     );
                     continue;
                 }
@@ -245,6 +281,21 @@ mod tests {
         let p2 = mock_profile("p2", 100, 100, Some("2026-01-19T10:00:00Z")); // Exhausted
 
         let candidates = select_candidates(vec![p1, p2]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "p1");
+    }
+
+    #[test]
+    fn test_select_candidates_includes_profiles_without_quota() {
+        let profiles = vec![ProfileSummary {
+            name: "p1".to_string(),
+            email: None,
+            is_current: false,
+            is_valid: true,
+            quota: None,
+        }];
+
+        let candidates = select_candidates(profiles);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "p1");
     }
