@@ -232,9 +232,8 @@ where
     // 4. Wait for callback
     let timeout = Duration::from_secs(5 * 60); // 5 minute timeout
     let start = std::time::Instant::now();
-    let mut auth_code = None;
 
-    loop {
+    let code = loop {
         if cancel_flag.load(Ordering::Relaxed) {
             anyhow::bail!("Login cancelled by user");
         }
@@ -265,8 +264,7 @@ where
                     }
 
                     send_success_response(&mut stream);
-                    auth_code = Some(code);
-                    break;
+                    break code;
                 } else if request.contains("error=") {
                     send_error_response(&mut stream, "Authentication was denied");
                     anyhow::bail!("Authentication was denied by user");
@@ -283,9 +281,7 @@ where
                 anyhow::bail!("Failed to accept connection: {}", e);
             }
         }
-    }
-
-    let code = auth_code.context("No authorization code received")?;
+    };
     on_status("Exchanging authorization code for tokens...".to_string());
 
     // 5. Exchange code for tokens (need to run async in sync context)

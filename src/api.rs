@@ -310,7 +310,8 @@ fn codex_usage_urls() -> Vec<String> {
 
     let mut urls = Vec::new();
     for base in base_urls {
-        for path in [CODEX_USAGE_PATH, CODEX_USAGE_FALLBACK_PATH] {
+        // Prefer the shorter/non-API path first; some deployments expose it without the /api prefix.
+        for path in [CODEX_USAGE_FALLBACK_PATH, CODEX_USAGE_PATH] {
             let url = join_url(&base, path);
             if !urls.contains(&url) {
                 urls.push(url);

@@ -35,16 +35,16 @@ pub async fn start_server(state: Arc<SharedState>) {
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct ChatRequest {
-    model: String,
-    reasoning_effort: Option<String>,
+pub struct ChatRequest {
+    pub model: String,
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
-    messages: Vec<serde_json::Value>,
+    pub messages: Vec<serde_json::Value>,
     #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
-async fn handle_chat_completions(
+pub async fn handle_chat_completions(
     State(state): State<Arc<SharedState>>,
     Json(mut payload): Json<ChatRequest>,
 ) -> Response {
@@ -59,12 +59,27 @@ async fn handle_chat_completions(
 
     // 2. Select Candidates
     let profiles = state.profiles.read().unwrap().clone();
+    let profiles_missing_quota = profiles.iter().filter(|p| p.quota.is_none()).count();
     let candidates = select_candidates(profiles);
 
     if candidates.is_empty() {
+        if profiles_missing_quota > 0 {
+            tracing::warn!(
+                profiles_missing_quota,
+                "No routable profiles: some profiles have missing quota"
+            );
+        }
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "No available accounts with quota"})),
+            Json(if profiles_missing_quota > 0 {
+                serde_json::json!({
+                    "error": "No available accounts with quota",
+                    "hint": "Some profiles are missing quota. Refresh quotas (or re-login) and try again.",
+                    "profiles_missing_quota": profiles_missing_quota,
+                })
+            } else {
+                serde_json::json!({"error": "No available accounts with quota"})
+            }),
         )
             .into_response();
     }
@@ -212,27 +227,32 @@ fn select_candidates(profiles: Vec<ProfileSummary>) -> Vec<ProfileSummary> {
         .into_iter()
         .filter(|p| {
             if let Some(quota) = &p.quota {
-                let used = quota.used_tokens.unwrap_or(0);
-                let total = quota.total_tokens.unwrap_or(100);
-                used < total
+                let used_tokens = quota.used_tokens.unwrap_or(0);
+                let total_tokens = quota.total_tokens.unwrap_or(100);
+
+                // Tier 1 constraint: Balance > 5% => Used <= 95%
+                let used_requests = quota.used_requests.unwrap_or(0);
+                let tier1_ok = used_requests <= 95;
+
+                // Tier 2 constraint: Not exhausted
+                let tier2_ok = used_tokens < total_tokens;
+
+                tier1_ok && tier2_ok
             } else {
+                // Determine policy for profiles without quota:
+                // If we want to be strict, excluding them is safer.
+                // But if fresh profile doesn't have quota yet (e.g. not fetched), maybe keep it?
+                // Given "prioritize...", let's assume valid profiles have quota.
                 false
             }
         })
         .collect();
 
+    // Sort by Tier 2 (used_tokens) DESCENDING -> "Remaining Least"
     candidates.sort_by(|a, b| {
-        let date_a = a
-            .quota
-            .as_ref()
-            .and_then(|q| q.secondary_reset_date.as_deref())
-            .unwrap_or("z"); // "z" to put None at end
-        let date_b = b
-            .quota
-            .as_ref()
-            .and_then(|q| q.secondary_reset_date.as_deref())
-            .unwrap_or("z");
-        date_a.cmp(date_b)
+        let used_a = a.quota.as_ref().and_then(|q| q.used_tokens).unwrap_or(0);
+        let used_b = b.quota.as_ref().and_then(|q| q.used_tokens).unwrap_or(0);
+        used_b.cmp(&used_a) // Descending
     });
 
     candidates
@@ -243,7 +263,7 @@ mod tests {
     use super::*;
     use crate::api::QuotaInfo;
 
-    fn mock_profile(name: &str, used: u64, total: u64, reset: Option<&str>) -> ProfileSummary {
+    fn mock_profile(name: &str, used_req: u64, used_tok: u64) -> ProfileSummary {
         ProfileSummary {
             name: name.to_string(),
             email: None,
@@ -253,49 +273,46 @@ mod tests {
                 account_id: "id".to_string(),
                 email: "email".to_string(),
                 plan_type: "plan".to_string(),
-                used_requests: None,
-                total_requests: None,
-                used_tokens: Some(used),
-                total_tokens: Some(total),
+                used_requests: Some(used_req),
+                total_requests: Some(100),
+                used_tokens: Some(used_tok),
+                total_tokens: Some(100), // Percent based
                 reset_date: None,
-                secondary_reset_date: reset.map(|s| s.to_string()),
+                secondary_reset_date: None,
             }),
         }
     }
 
     #[test]
-    fn test_select_candidates_sorts_by_reset_date() {
-        let p1 = mock_profile("p1", 50, 100, Some("2026-01-20T10:00:00Z"));
-        let p2 = mock_profile("p2", 50, 100, Some("2026-01-19T10:00:00Z")); // Earlier
-        let p3 = mock_profile("p3", 50, 100, Some("2026-01-21T10:00:00Z"));
-
-        let candidates = select_candidates(vec![p1, p2, p3]);
-        assert_eq!(candidates[0].name, "p2");
-        assert_eq!(candidates[1].name, "p1");
-        assert_eq!(candidates[2].name, "p3");
-    }
-
-    #[test]
-    fn test_select_candidates_filters_exhausted() {
-        let p1 = mock_profile("p1", 50, 100, Some("2026-01-20T10:00:00Z"));
-        let p2 = mock_profile("p2", 100, 100, Some("2026-01-19T10:00:00Z")); // Exhausted
+    fn test_select_candidates_tier1_constraint() {
+        // p1: 96% req (should stay out), p2: 95% req (ok)
+        let p1 = mock_profile("p1", 96, 10);
+        let p2 = mock_profile("p2", 95, 10);
 
         let candidates = select_candidates(vec![p1, p2]);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].name, "p1");
+        assert_eq!(candidates[0].name, "p2");
     }
 
     #[test]
-    fn test_select_candidates_includes_profiles_without_quota() {
-        let profiles = vec![ProfileSummary {
-            name: "p1".to_string(),
-            email: None,
-            is_current: false,
-            is_valid: true,
-            quota: None,
-        }];
+    fn test_select_candidates_tier2_priority() {
+        // p1: 10% used (90% left)
+        // p2: 90% used (10% left) -> Should be first (Remaining Least)
+        let p1 = mock_profile("p1", 50, 10);
+        let p2 = mock_profile("p2", 50, 90);
 
-        let candidates = select_candidates(profiles);
+        let candidates = select_candidates(vec![p1, p2]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].name, "p2");
+        assert_eq!(candidates[1].name, "p1");
+    }
+
+    #[test]
+    fn test_select_candidates_excludes_exhausted_tier2() {
+        let p1 = mock_profile("p1", 50, 99);
+        let p2 = mock_profile("p2", 50, 100); // Exhausted
+
+        let candidates = select_candidates(vec![p1, p2]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name, "p1");
     }

@@ -1,22 +1,8 @@
-pub mod api;
-pub mod app;
-pub mod app_state;
-pub mod auth;
-pub mod codex_types;
-pub mod config;
-mod dock;
-mod icon;
-mod login_output;
-pub mod oauth;
-mod profile;
-mod refresh;
-mod server;
-mod shared;
-mod state;
-#[cfg(test)]
-mod test_support;
-mod tray;
-mod worker;
+use codex_router::{app, icon};
+
+// Re-export specific modules if needed locally or just use them from codex_router
+// BUT main.rs cannot re-declare 'mod api' if accessing the same file.
+// The file api.rs belongs to lib.rs now.
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
