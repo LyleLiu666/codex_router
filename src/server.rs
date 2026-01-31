@@ -137,6 +137,9 @@ pub async fn handle_chat_completions(
         include: vec![],
         prompt_cache_key: None,
         text: None,
+        stream_options: Some(crate::codex_types::StreamOptions {
+            include_usage: true,
+        }),
     };
 
     let body_json = serde_json::to_value(&responses_req).unwrap();
@@ -189,7 +192,69 @@ pub async fn handle_chat_completions(
                 if resp.status().is_success() {
                     let status = resp.status();
                     let headers = resp.headers().clone();
-                    let body = axum::body::Body::from_stream(resp.bytes_stream());
+
+                    let usage_manager = state.usage.clone();
+                    let profile_name = profile.name.clone();
+                    let model_name = payload.model.clone();
+
+                    let stream = resp.bytes_stream();
+
+                    // Wrap the stream to inspect usage
+                    use futures::StreamExt;
+                    let body_stream = async_stream::stream! {
+                        let mut pinned_stream = Box::pin(stream);
+                        while let Some(item) = pinned_stream.next().await {
+                            match item {
+                                Ok(bytes) => {
+                                    // Try to parse usage from this chunk
+                                    // A robust implementation would be more careful about split JSON,
+                                    // but usage usually comes in a distinct final chunk or self-contained "usage": {...} block.
+                                    // We search for "usage": { ... } pattern or the last chunk.
+
+                                    // Simple heuristic: convert to string (lossy) and regex/search
+                                    // Note: this might be expensive for large chunks, but typically chunks are small text.
+                                    let s = String::from_utf8_lossy(&bytes);
+                                    if s.contains("\"usage\":") {
+                                        // Try to extract JSON lines
+                                        for line in s.split("\n") {
+                                            if let Some(data_str) = line.strip_prefix("data: ") {
+                                                 if data_str.trim() == "[DONE]" { continue; }
+                                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                                     if let Some(usage) = json.get("usage") {
+                                                         let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                         let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                         // Upstream might not have cache tokens in standard "usage", check extensions?
+                                                         // OpenAI: prompt_tokens_details: { cached_tokens: ... }
+                                                         // Anthropic via OAI compat: usage: { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens }
+
+                                                         let cache_read = usage.get("prompt_tokens_details")
+                                                             .and_then(|d| d.get("cached_tokens"))
+                                                             .and_then(|v| v.as_u64())
+                                                             .or_else(|| usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()));
+
+                                                         let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
+
+                                                         let _ = usage_manager.log_usage(
+                                                             &model_name,
+                                                             input_tokens,
+                                                             output_tokens,
+                                                             cache_read,
+                                                             cache_creation,
+                                                             &profile_name
+                                                         );
+                                                     }
+                                                 }
+                                            }
+                                        }
+                                    }
+                                    yield Ok(bytes);
+                                }
+                                Err(e) => yield Err(e),
+                            }
+                        }
+                    };
+
+                    let body = axum::body::Body::from_stream(body_stream);
 
                     let mut builder = Response::builder().status(status);
                     for (key, value) in &headers {

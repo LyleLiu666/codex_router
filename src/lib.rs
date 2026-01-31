@@ -16,4 +16,5 @@ pub mod state;
 #[cfg(test)]
 pub mod test_support;
 pub mod tray;
+pub mod usage;
 pub mod worker;
