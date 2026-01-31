@@ -85,6 +85,7 @@ async fn test_auto_switching_on_failure() {
 
     let state = Arc::new(SharedState {
         profiles: Arc::new(RwLock::new(profiles)),
+        usage: Arc::new(codex_router::usage::UsageManager::new().expect("Failed mock usage")),
     });
 
     // 4. Invoke Handler

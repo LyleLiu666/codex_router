@@ -23,13 +23,14 @@ pub struct UsageLog {
     pub profile: String,
 }
 
+#[derive(Debug)]
 pub struct UsageManager {
     log_path: PathBuf,
     // Simple in-memory cache for pricing for now
     pricing: Mutex<HashMap<String, ModelPricing>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ModelPricing {
     input_cost_per_m: f64,
     output_cost_per_m: f64,
@@ -164,4 +165,43 @@ pub struct UsageStats {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_log_usage() {
+        // Mock config::get_codex_home environment?
+        // UsageManager calls config::get_codex_home().
+        // We probably need to mock that or structure UsageManager to accept a path.
+        // It's hard to mock get_codex_home directly without support.
+        // Let's modify UsageManager::new to take an optional path or be testable.
+        // OR better, since I can't easily change `new` signature without affecting call sites (SharedState),
+        // I can just rely on `CODEX_HOME` env var if config uses it.
+        // Checking config.rs: it uses env::var("CODEX_HOME").
+
+        let temp_dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CODEX_HOME", temp_dir.path());
+        }
+
+        let mgr = UsageManager::new().unwrap();
+        mgr.log_usage("gpt-4o", 100, 50, None, None, "default")
+            .unwrap();
+
+        // Unset to be safe, though test thread safety with env vars is tricky.
+        // But cargo test runs in parallel. `rusty-fork` or `serial_test`?
+        // Or just run one test at a time.
+
+        let log_path = temp_dir.path().join("usage.jsonl");
+        assert!(log_path.exists());
+
+        let content = fs::read_to_string(log_path).unwrap();
+        assert!(content.contains("\"model\":\"gpt-4o\""));
+        assert!(content.contains("\"input_tokens\":100"));
+    }
 }
