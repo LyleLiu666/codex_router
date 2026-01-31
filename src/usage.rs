@@ -25,7 +25,6 @@ pub struct UsageLog {
 
 #[derive(Debug)]
 pub struct UsageManager {
-    log_path: PathBuf,
     // Simple in-memory cache for pricing for now
     pricing: Mutex<HashMap<String, ModelPricing>>,
 }
@@ -40,9 +39,6 @@ struct ModelPricing {
 
 impl UsageManager {
     pub fn new() -> Result<Self> {
-        let codex_home = config::get_codex_home()?;
-        let log_path = codex_home.join("usage.jsonl");
-
         // Initialize with rough defaults for popular models
         // TODO: Load from ccusage caching logic later
         let mut pricing = HashMap::new();
@@ -67,9 +63,19 @@ impl UsageManager {
         );
 
         Ok(Self {
-            log_path,
             pricing: Mutex::new(pricing),
         })
+    }
+
+    fn get_log_path(&self) -> PathBuf {
+        // Try getting CODEX_HOME, fallback to temp dir if it fails (e.g. in tests)
+        match config::get_codex_home() {
+            Ok(home) => home.join("usage.jsonl"),
+            Err(_) => {
+                // Determine fallback, e.g. temp dir
+                std::env::temp_dir().join("codex_router_usage_fallback.jsonl")
+            }
+        }
     }
 
     pub fn log_usage(
@@ -100,10 +106,12 @@ impl UsageManager {
         };
 
         let json = serde_json::to_string(&log)?;
+        let log_path = self.get_log_path();
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.log_path)?;
+            .open(&log_path)?;
 
         writeln!(file, "{}", json)?;
         Ok(())
@@ -135,11 +143,12 @@ impl UsageManager {
     pub fn get_stats(&self, days: i64) -> Result<UsageStats> {
         // TODO: Read file backwards or use rev_lines crate for efficiency if file is large
         // For now, simple read
-        if !self.log_path.exists() {
+        let log_path = self.get_log_path();
+        if !log_path.exists() {
             return Ok(UsageStats::default());
         }
 
-        let content = std::fs::read_to_string(&self.log_path)?;
+        let content = std::fs::read_to_string(&log_path)?;
         let cutoff = Utc::now() - chrono::Duration::days(days);
 
         let mut stats = UsageStats::default();
@@ -170,11 +179,13 @@ pub struct UsageStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvGuard, ENV_LOCK};
     use std::fs;
     use tempfile::tempdir;
 
     #[test]
     fn test_log_usage() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Mock config::get_codex_home environment?
         // UsageManager calls config::get_codex_home().
         // We probably need to mock that or structure UsageManager to accept a path.
@@ -185,9 +196,7 @@ mod tests {
         // Checking config.rs: it uses env::var("CODEX_HOME").
 
         let temp_dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("CODEX_HOME", temp_dir.path());
-        }
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
 
         let mgr = UsageManager::new().unwrap();
         mgr.log_usage("gpt-4o", 100, 50, None, None, "default")

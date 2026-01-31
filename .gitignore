@@ -23,3 +23,8 @@ dist/
 # Worktrees
 .worktrees
 .worktrees/
+
+# OpenSpec & Agents
+.agent/
+openspec/
+AGENTS.md
