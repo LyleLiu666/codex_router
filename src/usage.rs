@@ -153,6 +153,8 @@ impl UsageManager {
 
         let mut stats = UsageStats::default();
 
+        let mut daily_map: HashMap<String, DailyUsageStats> = HashMap::new();
+
         for line in content.lines() {
             if let Ok(log) = serde_json::from_str::<UsageLog>(line) {
                 if log.timestamp > cutoff {
@@ -160,9 +162,27 @@ impl UsageManager {
                     stats.total_input_tokens += log.input_tokens;
                     stats.total_output_tokens += log.output_tokens;
                     stats.total_cache_read_tokens += log.cache_read_tokens.unwrap_or(0);
+
+                    // Aggregate daily
+                    let date_str = log.timestamp.format("%Y-%m-%d").to_string();
+                    let daily = daily_map
+                        .entry(date_str.clone())
+                        .or_insert(DailyUsageStats {
+                            date: date_str,
+                            ..Default::default()
+                        });
+                    daily.cost_usd += log.cost_usd;
+                    daily.input_tokens += log.input_tokens;
+                    daily.output_tokens += log.output_tokens;
+                    daily.cache_read_tokens += log.cache_read_tokens.unwrap_or(0);
                 }
             }
         }
+
+        // Sort daily stats by date descending
+        let mut daily_vec: Vec<DailyUsageStats> = daily_map.into_values().collect();
+        daily_vec.sort_by(|a, b| b.date.cmp(&a.date));
+        stats.daily_stats = daily_vec;
 
         Ok(stats)
     }
@@ -174,6 +194,16 @@ pub struct UsageStats {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
+    pub daily_stats: Vec<DailyUsageStats>,
+}
+
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct DailyUsageStats {
+    pub date: String, // YYYY-MM-DD
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 #[cfg(test)]

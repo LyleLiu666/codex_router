@@ -239,27 +239,41 @@ impl eframe::App for RouterApp {
                     ui.group(|ui| {
                         ui.set_min_width(ui.available_width());
                         ui.heading("Usage (Last 5 Days)");
-                        egui::Grid::new("usage_stats_grid")
-                            .num_columns(2)
-                            .spacing([10.0, 4.0])
+
+                        egui::Grid::new("daily_usage_grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .spacing([20.0, 4.0])
                             .show(ui, |ui| {
-                                ui.label("Total Cost:");
-                                ui.strong(format!("${:.4}", stats.total_cost_usd));
+                                ui.strong("Date");
+                                ui.strong("Cost");
+                                ui.strong("Input");
+                                ui.strong("Output");
+                                ui.strong("Cache Read");
                                 ui.end_row();
 
-                                ui.label("Input Tokens:");
-                                ui.label(format!("{}", stats.total_input_tokens));
-                                ui.end_row();
-
-                                ui.label("Output Tokens:");
-                                ui.label(format!("{}", stats.total_output_tokens));
-                                ui.end_row();
-
-                                if stats.total_cache_read_tokens > 0 {
-                                    ui.label("Cache Read:");
-                                    ui.label(format!("{}", stats.total_cache_read_tokens));
+                                for daily in &stats.daily_stats {
+                                    ui.label(&daily.date);
+                                    ui.label(format!("${:.4}", daily.cost_usd));
+                                    ui.label(format!("{}", daily.input_tokens));
+                                    ui.label(format!("{}", daily.output_tokens));
+                                    ui.label(format!("{}", daily.cache_read_tokens));
                                     ui.end_row();
                                 }
+
+                                ui.separator();
+                                ui.separator();
+                                ui.separator();
+                                ui.separator();
+                                ui.separator();
+                                ui.end_row();
+
+                                ui.strong("Total");
+                                ui.strong(format!("${:.4}", stats.total_cost_usd));
+                                ui.strong(format!("{}", stats.total_input_tokens));
+                                ui.strong(format!("{}", stats.total_output_tokens));
+                                ui.strong(format!("{}", stats.total_cache_read_tokens));
+                                ui.end_row();
                             });
                     });
                     ui.add_space(10.0);
