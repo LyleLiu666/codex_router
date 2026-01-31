@@ -168,7 +168,7 @@ impl UsageManager {
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct UsageStats {
     pub total_cost_usd: f64,
     pub total_input_tokens: u64,

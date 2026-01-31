@@ -16,6 +16,7 @@ pub enum AppCommand {
     OpenLoginUrl(String),
     FetchQuota,
     FetchProfileQuota(String),
+    FetchUsageStats,
     Shutdown,
 }
 
@@ -37,6 +38,7 @@ pub enum AppEvent {
         name: String,
         quota: QuotaInfo,
     },
+    UsageStatsLoaded(crate::usage::UsageStats),
     Error(String),
 }
 
@@ -45,6 +47,7 @@ pub struct AppState {
     pub profiles: Vec<ProfileSummary>,
     pub current_profile: Option<String>,
     pub quota: Option<QuotaInfo>,
+    pub usage_stats: Option<crate::usage::UsageStats>,
     pub refresh_interval_seconds: u64,
     pub auto_refresh_enabled: bool,
     pub last_updated: Option<DateTime<Utc>>,
@@ -63,6 +66,7 @@ impl Default for AppState {
             profiles: Vec::new(),
             current_profile: None,
             quota: None,
+            usage_stats: None,
             refresh_interval_seconds: 600,
             auto_refresh_enabled: true,
             last_updated: None,
@@ -105,6 +109,9 @@ impl AppState {
                 if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == name) {
                     profile.quota = Some(quota);
                 }
+            }
+            AppEvent::UsageStatsLoaded(stats) => {
+                self.usage_stats = Some(stats);
             }
             AppEvent::ProfileSaved(outcome) => {
                 self.profile_message = Some(match outcome {

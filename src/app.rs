@@ -63,6 +63,7 @@ impl RouterApp {
             }
         };
         let _ = cmd_tx.send(AppCommand::LoadProfiles);
+        let _ = cmd_tx.send(AppCommand::FetchUsageStats);
 
         Self {
             state,
@@ -234,12 +235,43 @@ impl eframe::App for RouterApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Codex Router");
 
+                if let Some(stats) = &self.state.usage_stats {
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.heading("Usage (Last 5 Days)");
+                        egui::Grid::new("usage_stats_grid")
+                            .num_columns(2)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("Total Cost:");
+                                ui.strong(format!("${:.4}", stats.total_cost_usd));
+                                ui.end_row();
+
+                                ui.label("Input Tokens:");
+                                ui.label(format!("{}", stats.total_input_tokens));
+                                ui.end_row();
+
+                                ui.label("Output Tokens:");
+                                ui.label(format!("{}", stats.total_output_tokens));
+                                ui.end_row();
+
+                                if stats.total_cache_read_tokens > 0 {
+                                    ui.label("Cache Read:");
+                                    ui.label(format!("{}", stats.total_cache_read_tokens));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                    ui.add_space(10.0);
+                }
+
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label("Profiles");
                         if ui.button("Refresh").clicked() {
                             let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+                            let _ = self.cmd_tx.send(AppCommand::FetchUsageStats);
                             self.quota_refresh.clear();
                         }
 
@@ -261,6 +293,7 @@ impl eframe::App for RouterApp {
                             self.quota_refresh.clear();
                             if auto_refresh_enabled {
                                 let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+                                let _ = self.cmd_tx.send(AppCommand::FetchUsageStats);
                             }
                         }
 
@@ -451,6 +484,7 @@ impl eframe::App for RouterApp {
             interval,
         ) {
             let _ = self.cmd_tx.send(AppCommand::FetchQuota);
+            let _ = self.cmd_tx.send(AppCommand::FetchUsageStats);
         }
         if self.state.auto_refresh_enabled {
             ctx.request_repaint_after(interval);

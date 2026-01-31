@@ -199,15 +199,19 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                         profile = %name,
                                         "Access token expired, attempting refresh"
                                     );
-                                    match runtime.block_on(api::refresh_token(&tokens.refresh_token))
+                                    match runtime
+                                        .block_on(api::refresh_token(&tokens.refresh_token))
                                     {
                                         Ok(refresh_response) => {
                                             // Update auth with new tokens
                                             if let Some(ref mut tokens) = auth.tokens {
-                                                if let Some(new_access) = refresh_response.access_token {
+                                                if let Some(new_access) =
+                                                    refresh_response.access_token
+                                                {
                                                     tokens.access_token = new_access;
                                                 }
-                                                if let Some(new_refresh) = refresh_response.refresh_token
+                                                if let Some(new_refresh) =
+                                                    refresh_response.refresh_token
                                                 {
                                                     tokens.refresh_token = new_refresh;
                                                 }
@@ -229,10 +233,11 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                             // Retry quota fetch with new tokens
                                             match runtime.block_on(api::fetch_quota(&auth)) {
                                                 Ok(quota) => {
-                                                    let _ = evt_tx.send(AppEvent::ProfileQuotaLoaded {
-                                                        name,
-                                                        quota,
-                                                    });
+                                                    let _ =
+                                                        evt_tx.send(AppEvent::ProfileQuotaLoaded {
+                                                            name,
+                                                            quota,
+                                                        });
                                                 }
                                                 Err(retry_err) => {
                                                     tracing::warn!(
@@ -250,9 +255,9 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                                             profile.is_valid = false;
                                                             profile.quota = None;
                                                         }
-                                                        let _ = evt_tx.send(AppEvent::ProfilesLoaded(
-                                                            profiles,
-                                                        ));
+                                                        let _ = evt_tx.send(
+                                                            AppEvent::ProfilesLoaded(profiles),
+                                                        );
                                                     }
                                                 }
                                             }
@@ -263,14 +268,16 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                                                 error = %refresh_err,
                                                 "Token refresh failed"
                                             );
-                                            if let Ok(mut profiles) = profile::list_profiles_data() {
+                                            if let Ok(mut profiles) = profile::list_profiles_data()
+                                            {
                                                 if let Some(profile) =
                                                     profiles.iter_mut().find(|p| p.name == name)
                                                 {
                                                     profile.is_valid = false;
                                                     profile.quota = None;
                                                 }
-                                                let _ = evt_tx.send(AppEvent::ProfilesLoaded(profiles));
+                                                let _ =
+                                                    evt_tx.send(AppEvent::ProfilesLoaded(profiles));
                                             }
                                         }
                                     }
@@ -389,6 +396,28 @@ pub fn start_worker(cmd_rx: Receiver<AppCommand>, evt_tx: Sender<AppEvent>) -> J
                 }
                 AppCommand::OpenLoginUrl(url) => {
                     let _ = Command::new("open").arg(url).status();
+                }
+                AppCommand::FetchUsageStats => {
+                    use crate::usage::UsageManager;
+                    match UsageManager::new() {
+                        Ok(manager) => match manager.get_stats(5) {
+                            Ok(stats) => {
+                                let _ = evt_tx.send(AppEvent::UsageStatsLoaded(stats));
+                            }
+                            Err(err) => {
+                                let _ = evt_tx.send(AppEvent::Error(format!(
+                                    "Failed to fetch usage stats: {}",
+                                    err
+                                )));
+                            }
+                        },
+                        Err(err) => {
+                            let _ = evt_tx.send(AppEvent::Error(format!(
+                                "Failed to initialize usage manager: {}",
+                                err
+                            )));
+                        }
+                    }
                 }
                 AppCommand::Shutdown => break,
             }
@@ -664,6 +693,31 @@ mod tests {
     }
 
     #[test]
+    fn fetch_usage_stats_returns_event() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("CODEX_HOME", temp_dir.path());
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let handle = start_worker(cmd_rx, evt_tx);
+
+        cmd_tx.send(AppCommand::FetchUsageStats).unwrap();
+
+        let event = evt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match event {
+            AppEvent::UsageStatsLoaded(stats) => {
+                // Should at least be default/empty stats if file is missing, but success event
+                assert_eq!(stats.total_cost_usd, 0.0);
+            }
+            _ => panic!("unexpected event: {:?}", event),
+        }
+
+        cmd_tx.send(AppCommand::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn fetch_profile_quota_updates_specific_profile() {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -754,8 +808,10 @@ mod tests {
         let quota_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         quota_listener.set_nonblocking(true).unwrap();
         let quota_addr = quota_listener.local_addr().unwrap();
-        let _base_url_guard =
-            StringEnvGuard::set("CODEX_ROUTER_CHATGPT_BASE_URL", format!("http://{quota_addr}"));
+        let _base_url_guard = StringEnvGuard::set(
+            "CODEX_ROUTER_CHATGPT_BASE_URL",
+            format!("http://{quota_addr}"),
+        );
         let quota_server = thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut handled = 0;
