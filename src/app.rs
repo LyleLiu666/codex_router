@@ -238,7 +238,8 @@ impl eframe::App for RouterApp {
                 if let Some(stats) = &self.state.usage_stats {
                     ui.group(|ui| {
                         ui.set_min_width(ui.available_width());
-                        ui.heading("Usage (Last 5 Days)");
+                        ui.heading("Local Traffic Analysis");
+                        ui.label("Traffic routed through this application only.");
 
                         egui::Grid::new("daily_usage_grid")
                             .num_columns(5)
@@ -246,7 +247,7 @@ impl eframe::App for RouterApp {
                             .spacing([20.0, 4.0])
                             .show(ui, |ui| {
                                 ui.strong("Date");
-                                ui.strong("Cost");
+                                ui.strong("Cost (Est.)");
                                 ui.strong("Input");
                                 ui.strong("Output");
                                 ui.strong("Cache Read");
@@ -281,8 +282,11 @@ impl eframe::App for RouterApp {
 
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width());
+                    ui.heading("Codex Account Status");
+                    ui.label("Remote quota usage from official API.");
+                    ui.add_space(4.0);
+
                     ui.horizontal(|ui| {
-                        ui.label("Profiles");
                         if ui.button("Refresh").clicked() {
                             let _ = self.cmd_tx.send(AppCommand::FetchQuota);
                             let _ = self.cmd_tx.send(AppCommand::FetchUsageStats);
